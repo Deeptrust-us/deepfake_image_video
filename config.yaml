@@ -1,0 +1,81 @@
+# Dual-Stream Deepfake Detection Configuration
+
+# Data Configuration
+# Options:
+# - "UniDataPro/deepfake-videos-dataset" (10 video preview, full requires contact)
+# - "local" (for Celeb-DF v2, FaceForensics++, etc. - place videos in data/raw/)
+data:
+  dataset_name: "UniDataPro/deepfake-videos-dataset"  # or "local" for local videos
+  dataset_type: "huggingface"  # "huggingface" or "local"
+  data_root: "data"
+  raw_videos_dir: "data/raw"  # For local datasets
+  frames_dir: "data/frames"
+  faces_dir: "data/faces"
+  frequency_dir: "data/frequency"
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  frame_sampling_rate: 3  # frames per second
+  face_size: 224
+  face_crop_size: 256
+
+# Preprocessing
+preprocessing:
+  use_mtcnn: true
+  min_face_size: 40
+  frequency_log_scale: true
+  frequency_normalize: true
+  augmentations:
+    horizontal_flip: 0.5
+    rotation_range: 15
+    brightness_range: 0.2
+    contrast_range: 0.2
+    noise_std: 0.02  # Gaussian noise standard deviation (0 to disable)
+    gaussian_blur_prob: 0.3  # Probability of applying Gaussian blur
+
+# Model Architecture
+model:
+  spatial_backbone: "resnet18"  # or "efficientnet_b0"
+  spatial_feature_dim: 256
+  frequency_channels: 1  # 1 for magnitude only, 2 for magnitude+phase
+  # Frequency stream now uses ResNet50 backbone (no frequency_layers needed)
+  fusion_dim: 512
+  dropout: 0.6  # Increased dropout for better regularization
+  pretrained: true
+  freeze_spatial_backbone: false  # Set to true to freeze spatial backbone (only train FC layers)
+  freeze_frequency_backbone: false  # Set to true to freeze frequency backbone
+
+# Training Configuration
+training:
+  batch_size: 32
+  num_epochs: 50
+  learning_rate: 5e-5  # Lower learning rate for ResNet50 frequency stream
+  optimizer: "adam"  # or "sgd"
+  momentum: 0.9  # for SGD
+  weight_decay: 1e-5
+  use_focal_loss: true  # Use Focal Loss instead of weighted BCE
+  focal_loss_alpha: 0.25  # Weighting factor for positive class
+  focal_loss_gamma: 2.0  # Focusing parameter (higher = focus more on hard examples)
+  oversample_real: true  # Oversample real videos to balance training batches
+  real_oversample_ratio: 2.0  # How many times to oversample real videos (2.0 = 2x more real samples)
+  scheduler: "cosine"  # or "step"
+  scheduler_params:
+    step_size: 10
+    gamma: 0.1
+  early_stopping:
+    patience: 10
+    metric: "val_auc"
+  num_workers: 4
+  pin_memory: true
+
+# Evaluation
+evaluation:
+  metrics: ["accuracy", "precision", "recall", "f1", "auc", "eer"]
+  video_level_aggregation: "mean"  # or "max", "median"
+
+# Paths
+paths:
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  results_dir: "results"
+
