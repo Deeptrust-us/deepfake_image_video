@@ -1,9 +1,14 @@
 """Example usage script for dual-stream deepfake detection."""
 
+import os
+import sys
 import torch
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
+
+# Add parent directory to path to import src
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.models.dual_stream import DualStreamModel
 from src.utils.face_detection import FaceDetector

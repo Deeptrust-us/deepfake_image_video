@@ -20,7 +20,7 @@ echo "Steps:"
 echo "1. Visit: https://github.com/yuezunli/celeb-deepfakeforensics"
 echo "2. Follow their download instructions"
 echo "3. Extract videos to: data/raw/"
-echo "4. Run: python preprocess.py --dataset-type celebdf --videos-dir data/raw"
+echo "4. Run: python scripts/preprocess.py --dataset-type celebdf --videos-dir data/raw"
 echo ""
 
 echo "=== Option 2: FaceForensics++ ==="
@@ -29,7 +29,7 @@ echo "Steps:"
 echo "1. Visit: https://github.com/ondyari/FaceForensics"
 echo "2. Follow their download instructions"
 echo "3. Extract videos to: data/raw/"
-echo "4. Run: python preprocess.py --dataset-type faceforensics --videos-dir data/raw"
+echo "4. Run: python scripts/preprocess.py --dataset-type faceforensics --videos-dir data/raw"
 echo ""
 
 echo "=== Option 3: Quick Test with Synthetic Data ==="
@@ -49,7 +49,7 @@ echo "Downloading sample videos..."
 # Add YouTube URLs here
 # yt-dlp -f "best[height<=720]" -o "data/raw/youtube_samples/%(title)s.%(ext)s" <URL>
 
-echo "Done. Then run: python preprocess.py --dataset-type local --videos-dir data/raw/youtube_samples"
+echo "Done. Then run: python scripts/preprocess.py --dataset-type local --videos-dir data/raw/youtube_samples"
 EOF
     chmod +x download_youtube_samples.sh
     echo "Created download_youtube_samples.sh"

@@ -1,6 +1,7 @@
 """Evaluation script for dual-stream deepfake detection."""
 
 import os
+import sys
 import argparse
 import yaml
 import torch
@@ -11,6 +12,9 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
+
+# Add parent directory to path to import src
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.models.dual_stream import DualStreamModel
 from src.data.dataset import DeepfakeDataset
@@ -87,7 +91,7 @@ def plot_confusion_matrix(y_true, y_pred, save_path):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate dual-stream deepfake detection model")
-    parser.add_argument("--config", type=str, default="config.yaml", help="Path to config file")
+    parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to config file")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
     parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"], 
                        help="Dataset split to evaluate")

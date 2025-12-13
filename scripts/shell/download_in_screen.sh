@@ -1,7 +1,10 @@
 #!/bin/bash
 # Download Celeb-DF v2 in a screen session
 
-cd /home/felipeEngin/Documents/deepfake_image_video
+# Get script directory and project root
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+PROJECT_ROOT="$( cd "$SCRIPT_DIR/../.." && pwd )"
+cd "$PROJECT_ROOT"
 
 echo "Starting Celeb-DF v2 download in screen session 'download'..."
 echo ""
@@ -15,7 +18,7 @@ if screen -list | grep -q "download"; then
 fi
 
 # Start download in screen session
-screen -S download bash -c "cd /home/felipeEngin/Documents/deepfake_image_video && python download_celebdf_complete.py 2>&1 | tee download.log"
+screen -S download bash -c "cd '$PROJECT_ROOT' && python scripts/download/download_celebdf_complete.py 2>&1 | tee download.log"
 
 echo ""
 echo "Download started in screen session 'download'"

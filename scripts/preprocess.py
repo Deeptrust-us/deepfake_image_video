@@ -1,9 +1,13 @@
 """Data preprocessing script for downloading and processing deepfake datasets."""
 
+import os
+import sys
 import argparse
 import yaml
 import torch
-import os
+
+# Add parent directory to path to import src
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.data.preprocessing import download_and_preprocess_huggingface_dataset
 from src.data.local_preprocessing import (
@@ -15,7 +19,7 @@ from src.data.local_preprocessing import (
 
 def main():
     parser = argparse.ArgumentParser(description="Preprocess deepfake dataset")
-    parser.add_argument("--config", type=str, default="config.yaml", help="Path to config file")
+    parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to config file")
     parser.add_argument("--dataset", type=str, default=None, help="Override dataset name from config")
     parser.add_argument("--dataset-type", type=str, default=None, 
                        choices=["huggingface", "local", "celebdf", "faceforensics"],

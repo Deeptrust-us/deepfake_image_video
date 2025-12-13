@@ -1,6 +1,7 @@
 """Training script for dual-stream deepfake detection."""
 
 import os
+import sys
 import argparse
 import yaml
 import torch
@@ -11,6 +12,9 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import numpy as np
 from pathlib import Path
+
+# Add parent directory to path to import src
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.models.dual_stream import DualStreamModel
 from src.data.dataset import DeepfakeDataset
@@ -121,7 +125,7 @@ def validate(model, dataloader, criterion, device):
 
 def main():
     parser = argparse.ArgumentParser(description="Train dual-stream deepfake detection model")
-    parser.add_argument("--config", type=str, default="config.yaml", help="Path to config file")
+    parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to config file")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
     

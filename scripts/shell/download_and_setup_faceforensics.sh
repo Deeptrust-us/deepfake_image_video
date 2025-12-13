@@ -36,9 +36,14 @@ echo "Downloading FaceForensics++ datasets..."
 echo "This may take a while depending on your internet speed..."
 echo ""
 
+# Get script directory and project root
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+PROJECT_ROOT="$( cd "$SCRIPT_DIR/../.." && pwd )"
+cd "$PROJECT_ROOT"
+
 # Download original (real) videos
 echo "1. Downloading original (real) videos..."
-python download_faceforensics.py "$DOWNLOAD_DIR" \
+python scripts/download/download_faceforensics.py "$DOWNLOAD_DIR" \
     -d original \
     -c "$COMPRESSION" \
     -t videos \
@@ -49,7 +54,7 @@ python download_faceforensics.py "$DOWNLOAD_DIR" \
 for dataset in Deepfakes Face2Face FaceSwap NeuralTextures; do
     echo ""
     echo "2. Downloading $dataset (fake) videos..."
-    python download_faceforensics.py "$DOWNLOAD_DIR" \
+    python scripts/download/download_faceforensics.py "$DOWNLOAD_DIR" \
         -d "$dataset" \
         -c "$COMPRESSION" \
         -t videos \
@@ -64,9 +69,9 @@ echo "=========================================="
 echo ""
 echo "Next steps:"
 echo "1. Preprocess the downloaded videos:"
-echo "   python preprocess.py --dataset-type faceforensics --videos-dir $DOWNLOAD_DIR"
+echo "   python scripts/preprocess.py --dataset-type faceforensics --videos-dir $DOWNLOAD_DIR"
 echo ""
 echo "2. Or process manually:"
-echo "   python preprocess.py --dataset-type faceforensics --videos-dir $DOWNLOAD_DIR --max_videos 1000"
+echo "   python scripts/preprocess.py --dataset-type faceforensics --videos-dir $DOWNLOAD_DIR --max_videos 1000"
 echo ""
 
