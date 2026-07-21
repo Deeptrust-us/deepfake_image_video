@@ -145,6 +145,9 @@ def parse_args():
 
                         )
 
+    parser.add_argument('-y', '--yes', action='store_true',
+                        help='Automatically agree to TOS and run non-interactively.')
+
     args = parser.parse_args()
 
 
@@ -281,9 +284,11 @@ def main(args):
 
     print('***')
 
-    print('Press any key to continue, or CTRL-C to exit.')
-
-    _ = input('')
+    if not getattr(args, 'yes', False) and sys.stdin.isatty():
+        print('Press any key to continue, or CTRL-C to exit.')
+        _ = input('')
+    else:
+        print('Automated non-interactive mode: TOS agreed.')
 
 
 

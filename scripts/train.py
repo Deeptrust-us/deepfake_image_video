@@ -16,7 +16,7 @@ from pathlib import Path
 # Add parent directory to path to import src
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.models.dual_stream import DualStreamModel
+from src.models import get_model, DualStreamModel
 from src.data.dataset import DeepfakeDataset
 from src.utils.augmentations import DualStreamAugmentation
 from src.utils.face_detection import FaceDetector
@@ -126,6 +126,9 @@ def validate(model, dataloader, criterion, device):
 def main():
     parser = argparse.ArgumentParser(description="Train dual-stream deepfake detection model")
     parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to config file")
+    parser.add_argument("--model", type=str, default="quad_stream",
+                        choices=["xception", "rgb_fft_dual_stream", "two_stream", "quad_stream"],
+                        help="Model architecture to train")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
     
@@ -226,15 +229,8 @@ def main():
             pin_memory=config['training']['pin_memory']
         )
     
-    # Initialize model
-    model = DualStreamModel(
-        spatial_backbone=config['model']['spatial_backbone'],
-        spatial_feature_dim=config['model']['spatial_feature_dim'],
-        frequency_channels=config['model']['frequency_channels'],
-        fusion_dim=config['model']['fusion_dim'],
-        dropout=config['model']['dropout'],
-        pretrained=config['model']['pretrained']
-    ).to(device)
+    # Initialize model using factory
+    model = get_model(args.model, config).to(device)
     
     # Freeze backbones if requested
     freeze_spatial = config['model'].get('freeze_spatial_backbone', False)

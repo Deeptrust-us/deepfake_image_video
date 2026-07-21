@@ -8,6 +8,31 @@ from sklearn.metrics import (
 from typing import Dict, Tuple
 
 
+def find_optimal_threshold(y_true: np.ndarray, y_proba: np.ndarray) -> float:
+    """
+    Find optimal classification threshold that maximizes F1-score.
+
+    Args:
+        y_true: True binary labels
+        y_proba: Predicted probabilities
+
+    Returns:
+        Optimal threshold float value (between 0.05 and 0.95)
+    """
+    best_thresh = 0.5
+    best_f1 = -1.0
+
+    thresholds = np.linspace(0.05, 0.95, 91)
+    for thresh in thresholds:
+        preds = (y_proba >= thresh).astype(int)
+        score = f1_score(y_true, preds, zero_division=0)
+        if score > best_f1:
+            best_f1 = score
+            best_thresh = thresh
+
+    return float(best_thresh)
+
+
 def compute_frame_metrics(y_true: np.ndarray, y_pred: np.ndarray, 
                          y_proba: np.ndarray) -> Dict[str, float]:
     """
