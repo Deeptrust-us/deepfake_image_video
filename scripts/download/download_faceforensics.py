@@ -133,13 +133,9 @@ def parse_args():
 
                              ' dataset.')
 
-    parser.add_argument('--server', type=str, default='EU',
+    parser.add_argument('--server', type=str, default='EU2',
 
-                        help='Server to download the data from. If you '
-
-                             'encounter a slow download speed, consider '
-
-                             'changing the server.',
+                        help='Server to download the data from. Defaults to EU2 (kaldir server).',
 
                         choices=SERVERS
 
@@ -236,37 +232,60 @@ def download_file(url, out_file, report_progress=False, max_retries=3, timeout=3
         tqdm.write('WARNING: skipping download of existing file ' + out_file)
         return
 
-    for attempt in range(max_retries):
-        try:
-            fh, out_file_tmp = tempfile.mkstemp(dir=out_dir)
-            f = os.fdopen(fh, 'w')
-            f.close()
+    # Build fallback candidate URLs in case primary server is down
+    candidate_urls = [url]
+    known_servers = [
+        'http://kaldir.vc.in.tum.de/faceforensics/v3/',
+        'http://canis.vc.in.tum.de:8100/v3/',
+        'http://falas.cmpt.sfu.ca:8100/v3/'
+    ]
+    for s_base in known_servers:
+        if '/v3/' in url:
+            rel_subpath = url.split('/v3/', 1)[1]
+            alt_url = s_base + rel_subpath
+            if alt_url not in candidate_urls:
+                candidate_urls.append(alt_url)
 
-            # Create request with timeout
-            req = urllib.request.Request(url)
-            
-            if report_progress:
-                urllib.request.urlretrieve(url, out_file_tmp, reporthook=reporthook)
-            else:
-                # Use urlopen with timeout for better error handling
-                with urllib.request.urlopen(req, timeout=timeout) as response:
-                    with open(out_file_tmp, 'wb') as f:
-                        f.write(response.read())
-            
-            os.rename(out_file_tmp, out_file)
-            return  # Success
-            
-        except (urllib.error.URLError, socket.timeout, ConnectionError) as e:
-            if attempt < max_retries - 1:
-                wait_time = (attempt + 1) * 5  # Exponential backoff
-                tqdm.write(f'Retry {attempt + 1}/{max_retries} after {wait_time}s: {str(e)}')
-                time.sleep(wait_time)
-            else:
-                raise Exception(f'Failed to download {url} after {max_retries} attempts: {str(e)}')
-        except Exception as e:
-            if os.path.exists(out_file_tmp):
-                os.remove(out_file_tmp)
-            raise
+    last_error = None
+    for attempt in range(max_retries):
+        for candidate_url in candidate_urls:
+            try:
+                fh, out_file_tmp = tempfile.mkstemp(dir=out_dir)
+                f = os.fdopen(fh, 'w')
+                f.close()
+
+                req = urllib.request.Request(candidate_url)
+                if report_progress:
+                    urllib.request.urlretrieve(candidate_url, out_file_tmp, reporthook=reporthook)
+                else:
+                    with urllib.request.urlopen(req, timeout=timeout) as response:
+                        with open(out_file_tmp, 'wb') as f:
+                            f.write(response.read())
+
+                os.rename(out_file_tmp, out_file)
+                return  # Success
+            except (urllib.error.URLError, socket.timeout, ConnectionError) as e:
+                last_error = e
+                if os.path.exists(out_file_tmp):
+                    try:
+                        os.remove(out_file_tmp)
+                    except Exception:
+                        pass
+                continue
+            except Exception as e:
+                if os.path.exists(out_file_tmp):
+                    try:
+                        os.remove(out_file_tmp)
+                    except Exception:
+                        pass
+                raise
+
+        if attempt < max_retries - 1:
+            wait_time = (attempt + 1) * 5
+            tqdm.write(f'Retry {attempt + 1}/{max_retries} across servers after {wait_time}s: {str(last_error)}')
+            time.sleep(wait_time)
+
+    raise Exception(f'Failed to download {url} after trying all fallback servers: {str(last_error)}')
 
 
 
@@ -284,11 +303,14 @@ def main(args):
 
     print('***')
 
-    if not getattr(args, 'yes', False) and sys.stdin.isatty():
-        print('Press any key to continue, or CTRL-C to exit.')
-        _ = input('')
-    else:
+    if getattr(args, 'yes', False) or not sys.stdin.isatty() or os.environ.get('NONINTERACTIVE') == '1':
         print('Automated non-interactive mode: TOS agreed.')
+    else:
+        print('Press any key to continue, or CTRL-C to exit.')
+        try:
+            _ = input('')
+        except (EOFError, KeyboardInterrupt):
+            print('Non-interactive environment detected: TOS agreed.')
 
 
 
@@ -384,6 +406,7 @@ def main(args):
                         filelist = filepaths['actors']
                     else:
                         filelist = filepaths['DeepFakesDetection']
+                    args.base_url = base_url_attempt
                     print(f'Successfully connected to {base_url_attempt}')
                     break  # Success
                     
@@ -394,6 +417,7 @@ def main(args):
                     filelist = []
                     for pair in file_pairs:
                         filelist += pair
+                    args.base_url = base_url_attempt
                     print(f'Successfully connected to {base_url_attempt}')
                     break  # Success
                     
@@ -406,6 +430,7 @@ def main(args):
                         filelist.append('_'.join(pair))
                         if c_type != 'models':
                             filelist.append('_'.join(pair[::-1]))
+                    args.base_url = base_url_attempt
                     print(f'Successfully connected to {base_url_attempt}')
                     break  # Success
                     
