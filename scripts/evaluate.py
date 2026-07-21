@@ -116,8 +116,17 @@ def main():
     parser.add_argument("--output_dir", type=str, default="results", help="Output directory for results")
     args = parser.parse_args()
 
+    # Resolve config path robustly
+    config_path = args.config
+    if not os.path.exists(config_path):
+        alt_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', args.config))
+        if os.path.exists(alt_path):
+            config_path = alt_path
+        elif os.path.exists(os.path.join('/content/deepfake_image_video', args.config)):
+            config_path = os.path.join('/content/deepfake_image_video', args.config)
+
     # Load config
-    with open(args.config, 'r') as f:
+    with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
     # Set device

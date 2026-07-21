@@ -47,6 +47,7 @@ python "$WORK_DIR/scripts/download/download_faceforensics.py" "$WORK_DIR/data/fa
 # 3. Preprocess Dataset
 echo "3. Preprocessing FaceForensics++ frames and faces..."
 python "$WORK_DIR/scripts/preprocess.py" \
+    --config "$WORK_DIR/config/config.yaml" \
     --dataset-type faceforensics \
     --videos-dir "$WORK_DIR/data/faceforensics_raw" \
     --max_videos $((NUM_VIDEOS * 2))
