@@ -76,14 +76,23 @@ def compute_eer(y_true: np.ndarray, y_proba: np.ndarray) -> float:
     Returns:
         EER value
     """
-    fpr, tpr, thresholds = roc_curve(y_true, y_proba)
-    fnr = 1 - tpr
-    
-    # Find threshold where FPR = FNR
-    eer_threshold = thresholds[np.nanargmin(np.absolute(fnr - fpr))]
-    eer = fpr[np.nanargmin(np.absolute(fnr - fpr))]
-    
-    return float(eer)
+    if len(np.unique(y_true)) < 2:
+        return 0.5
+        
+    try:
+        fpr, tpr, thresholds = roc_curve(y_true, y_proba)
+        fnr = 1 - tpr
+        
+        # Check if difference contains NaNs
+        diff = np.absolute(fnr - fpr)
+        if np.isnan(diff).all():
+            return 0.5
+            
+        idx = np.nanargmin(diff)
+        eer = fpr[idx]
+        return float(eer)
+    except Exception:
+        return 0.5
 
 
 def compute_video_metrics(video_predictions: Dict[str, np.ndarray],
