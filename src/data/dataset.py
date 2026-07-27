@@ -138,9 +138,9 @@ class DeepfakeDataset(Dataset):
         face_freq = self._load_frequency(item.get('face_frequency_path', ''), face_rgb)
         frame_freq = self._load_frequency(item.get('frame_frequency_path', item.get('frequency_path', '')), frame_rgb)
 
-        # Convert RGB images to Tensors & apply normalization
-        face_spatial_tensor = self.transform(face_rgb)
-        frame_spatial_tensor = self.transform(frame_rgb)
+        # Convert RGB images to Tensors & apply normalization and cast to float32
+        face_spatial_tensor = self.transform(face_rgb).float()
+        frame_spatial_tensor = self.transform(frame_rgb).float()
 
         # Convert Frequency arrays to Tensors (C, H, W)
         face_freq_tensor = torch.from_numpy(face_freq).permute(2, 0, 1).float()
