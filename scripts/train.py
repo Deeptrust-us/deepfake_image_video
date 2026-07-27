@@ -184,6 +184,18 @@ def main():
         is_training=True
     )
     
+    # Strict label verification for training dataset
+    train_labels = [item['label'] for item in train_dataset.samples]
+    for lbl in train_labels:
+        if lbl not in [0, 1]:
+            raise ValueError(f"CRITICAL ERROR: Training dataset contains invalid non-binary label: {lbl}. Expected 0 or 1.")
+            
+    train_real = train_labels.count(0)
+    train_fake = train_labels.count(1)
+    print(f"Verified training split: Real={train_real}, Fake={train_fake}")
+    if train_real == 0 or train_fake == 0:
+        raise ValueError(f"CRITICAL ERROR: Training split is degenerate. Both classes must be present! (Real={train_real}, Fake={train_fake})")
+
     # Check if validation set exists and has data
     val_metadata_path = os.path.join(data_root, "val_metadata.json")
     if os.path.exists(val_metadata_path):
@@ -196,6 +208,19 @@ def main():
             normalize_frequency=config['preprocessing']['frequency_normalize'],
             is_training=False
         )
+        
+        # Strict label verification for validation dataset
+        val_labels = [item['label'] for item in val_dataset.samples]
+        for lbl in val_labels:
+            if lbl not in [0, 1]:
+                raise ValueError(f"CRITICAL ERROR: Validation dataset contains invalid non-binary label: {lbl}. Expected 0 or 1.")
+                
+        val_real = val_labels.count(0)
+        val_fake = val_labels.count(1)
+        print(f"Verified validation split: Real={val_real}, Fake={val_fake}")
+        if val_real == 0 or val_fake == 0:
+            raise ValueError(f"CRITICAL ERROR: Validation split is degenerate. Both classes must be present! (Real={val_real}, Fake={val_fake})")
+
         val_loader = DataLoader(
             val_dataset,
             batch_size=config['training']['batch_size'],
@@ -401,16 +426,20 @@ def main():
         
         # Save best model
         model_name_clean = args.model.lower().replace("-", "_")
+        best_path = os.path.abspath(os.path.join(config['paths']['checkpoint_dir'], f'best_model_{model_name_clean}.pth'))
+        latest_path = os.path.abspath(os.path.join(config['paths']['checkpoint_dir'], f'latest_{model_name_clean}.pth'))
+        
         if val_metrics['auc'] > best_val_auc:
             best_val_auc = val_metrics['auc']
-            torch.save(checkpoint, os.path.join(config['paths']['checkpoint_dir'], f'best_model_{model_name_clean}.pth'))
+            torch.save(checkpoint, best_path)
             patience_counter = 0
-            print(f"  ✓ Saved best model (AUC: {best_val_auc:.4f})")
+            print(f"  ✓ Saved best model checkpoint to: {best_path} (AUC: {best_val_auc:.4f})")
         else:
             patience_counter += 1
         
         # Save latest checkpoint
-        torch.save(checkpoint, os.path.join(config['paths']['checkpoint_dir'], f'latest_{model_name_clean}.pth'))
+        torch.save(checkpoint, latest_path)
+        print(f"  ✓ Saved latest model checkpoint to: {latest_path}")
         
         # Early stopping
         if patience_counter >= config['training']['early_stopping']['patience']:

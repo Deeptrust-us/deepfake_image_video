@@ -50,7 +50,8 @@ def save_processed_sample(
     frame_rgb: np.ndarray,
     face_detector: Optional[FaceDetector],
     output_root: str,
-    use_phase: bool = False
+    use_phase: bool = False,
+    video_path: str = ""
 ) -> Dict[str, Any]:
     """Process single frame: detect face, compute frequency, save files, return metadata entry."""
     frames_dir = os.path.join(output_root, "frames", video_id)
@@ -102,47 +103,256 @@ def save_processed_sample(
         'frame_path': rel_frame,
         'face_path': rel_face,
         'face_frequency_path': rel_freq,
-        'frequency_path': rel_freq
+        'frequency_path': rel_freq,
+        'video_path': video_path
     }
 
 
-def split_and_save_metadata(sample_entries: List[Dict[str, Any]], output_root: str, train_ratio=0.7, val_ratio=0.15):
-    """Group samples by video_id and save stratified train/val/test metadata JSON files."""
-    video_map = {}
+import urllib.request
+
+def extract_source_video_ids(path: str) -> List[str]:
+    """
+    Extract all source video ID numbers or keys from a filename.
+    e.g., '000.mp4' -> ['000']
+          '000_111.mp4' -> ['000', '111']
+          'id0_id16_0000.mp4' -> ['id0', 'id16', '0000']
+    """
+    basename = os.path.splitext(os.path.basename(path))[0]
+    parts = basename.split('_')
+    ids = []
+    for p in parts:
+        if p and p.lower() not in ["c23", "c40", "raw", "videos", "masks"]:
+            ids.append(p)
+    return ids
+
+
+def load_official_ff_splits(data_root: str) -> Tuple[Optional[set], Optional[set], Optional[set]]:
+    """
+    Download or load official FaceForensics++ splits.
+    """
+    splits_dir = os.path.join(data_root, "official_splits")
+    os.makedirs(splits_dir, exist_ok=True)
+    
+    splits = {}
+    for split_name in ["train", "val", "test"]:
+        local_path = os.path.join(splits_dir, f"{split_name}.json")
+        if not os.path.exists(local_path):
+            url = f"https://raw.githubusercontent.com/ondyari/FaceForensics/master/dataset/splits/{split_name}.json"
+            print(f"Downloading official FaceForensics++ split '{split_name}' from: {url}")
+            try:
+                urllib.request.urlretrieve(url, local_path)
+            except Exception as e:
+                print(f"Warning: Could not download official splits ({e}). Falling back to custom splitting.")
+                return None, None, None
+        
+        try:
+            with open(local_path, "r") as f:
+                raw_data = json.load(f)
+                flat_list = []
+                for item in raw_data:
+                    if isinstance(item, list):
+                        flat_list.extend(item)
+                    else:
+                        flat_list.append(item)
+                splits[split_name] = set(flat_list)
+        except Exception as e:
+            print(f"Warning: Error reading split file {local_path} ({e}).")
+            return None, None, None
+            
+    return splits.get("train"), splits.get("val"), splits.get("test")
+
+
+def partition_by_connected_components(sample_entries: List[Dict[str, Any]], train_ratio=0.7, val_ratio=0.15):
+    """
+    Prevent data leakage by grouping related source video IDs into connected components
+    and partitioning components into train, val, and test splits.
+    """
+    from collections import defaultdict
+    
+    adj = defaultdict(set)
+    all_ids = set()
+    video_to_ids = {}
+    
     for sample in sample_entries:
-        vid = sample['video_id']
-        if vid not in video_map:
-            video_map[vid] = []
-        video_map[vid].append(sample)
-
-    video_ids = list(video_map.keys())
-    np.random.seed(42)
-    np.random.shuffle(video_ids)
-
-    n_total = len(video_ids)
-    n_train = int(n_total * train_ratio)
-    n_val = int(n_total * val_ratio)
-
-    train_vids = set(video_ids[:n_train])
-    val_vids = set(video_ids[n_train:n_train + n_val])
-    test_vids = set(video_ids[n_train + n_val:])
-
-    train_samples, val_samples, test_samples = [], [], []
-
-    for vid, samples in video_map.items():
-        if vid in train_vids:
-            train_samples.extend(samples)
-        elif vid in val_vids:
-            val_samples.extend(samples)
+        video_id = sample['video_id']
+        if video_id not in video_to_ids:
+            source_ids = extract_source_video_ids(sample.get('video_path', ''))
+            video_to_ids[video_id] = source_ids
+            for s_id in source_ids:
+                all_ids.add(s_id)
+                for other_id in source_ids:
+                    if s_id != other_id:
+                        adj[s_id].add(other_id)
+                        
+    visited = set()
+    components = []
+    
+    for s_id in sorted(list(all_ids)):
+        if s_id not in visited:
+            component = []
+            queue = [s_id]
+            visited.add(s_id)
+            while queue:
+                curr = queue.pop(0)
+                component.append(curr)
+                for neighbor in sorted(list(adj[curr])):
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+            components.append(component)
+            
+    components.sort(key=lambda c: sorted(c))
+    import random
+    random_state = random.Random(42)
+    random_state.shuffle(components)
+    
+    total_ids = len(all_ids)
+    train_target = int(total_ids * train_ratio)
+    val_target = int(total_ids * val_ratio)
+    
+    train_ids = set()
+    val_ids = set()
+    test_ids = set()
+    
+    current_train_count = 0
+    current_val_count = 0
+    
+    for comp in components:
+        comp_set = set(comp)
+        if current_train_count < train_target:
+            train_ids.update(comp_set)
+            current_train_count += len(comp_set)
+        elif current_val_count < val_target:
+            val_ids.update(comp_set)
+            current_val_count += len(comp_set)
         else:
-            test_samples.extend(samples)
+            test_ids.update(comp_set)
+            
+    return train_ids, val_ids, test_ids
 
+
+def assign_splits(sample_entries: List[Dict[str, Any]], data_root: str, train_ratio=0.7, val_ratio=0.15):
+    """
+    Assign each sample entry to train, val, or test split using official splits if available,
+    otherwise falling back to connected component partitioning.
+    """
+    train_ids, val_ids, test_ids = load_official_ff_splits(data_root)
+    
+    if train_ids and val_ids and test_ids:
+        print("✓ Using official FaceForensics++ splits.")
+    else:
+        print("⚠️  Official splits not available. Partitioning using connected components to prevent leakage...")
+        train_ids, val_ids, test_ids = partition_by_connected_components(sample_entries, train_ratio, val_ratio)
+        
+    train_samples = []
+    val_samples = []
+    test_samples = []
+    
+    for sample in sample_entries:
+        source_ids = extract_source_video_ids(sample.get('video_path', ''))
+        is_train = any(s_id in train_ids for s_id in source_ids)
+        is_val = any(s_id in val_ids for s_id in source_ids)
+        is_test = any(s_id in test_ids for s_id in source_ids)
+        
+        if is_train:
+            train_samples.append(sample)
+        elif is_val:
+            val_samples.append(sample)
+        elif is_test:
+            test_samples.append(sample)
+        else:
+            # Fallback for unmapped IDs
+            train_samples.append(sample)
+            
+    return train_samples, val_samples, test_samples
+
+
+def validate_splits_and_metadata(train_samples, val_samples, test_samples):
+    """
+    Validate dataset splits for path existence, deduplication, overlap, and class balance.
+    """
+    print("\n" + "=" * 60)
+    print(" RUNNING PREPROCESSING METADATA VALIDATION CHECK")
+    print("=" * 60)
+    
+    splits = {
+        'train': train_samples,
+        'val': val_samples,
+        'test': test_samples
+    }
+    
+    split_source_ids = {}
+    
+    for name, samples in splits.items():
+        if len(samples) == 0:
+            raise ValueError(f"CRITICAL ERROR: Split '{name}' has zero sample entries!")
+            
+        real_count = sum(1 for s in samples if s['label'] == 0)
+        fake_count = sum(1 for s in samples if s['label'] == 1)
+        
+        # Check label validity
+        invalid_labels = [s['label'] for s in samples if s['label'] not in [0, 1]]
+        if invalid_labels:
+            raise ValueError(f"CRITICAL ERROR: Split '{name}' contains invalid non-binary labels: {set(invalid_labels)}")
+            
+        print(f"Split '{name}': Total={len(samples)}, Real={real_count}, Fake={fake_count}")
+        
+        # Check class balance (assert both classes exist)
+        if real_count == 0 or fake_count == 0:
+            raise ValueError(f"CRITICAL ERROR: Split '{name}' has degenerate class balance (Real={real_count}, Fake={fake_count})!")
+            
+        # Check path existence
+        for s in samples:
+            face_path = s.get('face_path', '')
+            frame_path = s.get('frame_path', '')
+            # Relative paths inside metadata, resolve using config data_root/parent if needed
+            # Since local paths are relative to output_root, we skip if validation runs before metadata is saved
+            # but we check if they exist relative to current path
+            if face_path and not os.path.exists(face_path) and not os.path.exists(os.path.join("data", face_path)):
+                raise FileNotFoundError(f"CRITICAL ERROR: Face path not found: {face_path}")
+            if frame_path and not os.path.exists(frame_path) and not os.path.exists(os.path.join("data", frame_path)):
+                raise FileNotFoundError(f"CRITICAL ERROR: Frame path not found: {frame_path}")
+                
+        # Check duplicates
+        face_paths = [s.get('face_path') for s in samples if s.get('face_path')]
+        if len(face_paths) != len(set(face_paths)):
+            print("⚠️  Warning: Duplicate face paths found in metadata (harmless if multiple crops per frame).")
+            
+        # Collect source IDs
+        s_ids = set()
+        for s in samples:
+            s_ids.update(extract_source_video_ids(s.get('video_path', '')))
+        split_source_ids[name] = s_ids
+        
+    # Check overlap
+    overlap_train_val = split_source_ids['train'].intersection(split_source_ids['val'])
+    overlap_train_test = split_source_ids['train'].intersection(split_source_ids['test'])
+    overlap_val_test = split_source_ids['val'].intersection(split_source_ids['test'])
+    
+    if overlap_train_val:
+        raise ValueError(f"CRITICAL ERROR: Leakage detected between Train and Val splits! Overlapping IDs: {overlap_train_val}")
+    if overlap_train_test:
+        raise ValueError(f"CRITICAL ERROR: Leakage detected between Train and Test splits! Overlapping IDs: {overlap_train_test}")
+    if overlap_val_test:
+        raise ValueError(f"CRITICAL ERROR: Leakage detected between Val and Test splits! Overlapping IDs: {overlap_val_test}")
+        
+    print("✓ All validation checks passed successfully!")
+    print("=" * 60 + "\n")
+
+
+def split_and_save_metadata(sample_entries: List[Dict[str, Any]], output_root: str, train_ratio=0.7, val_ratio=0.15):
+    """Group samples by base_video_id and save stratified train/val/test metadata JSON files."""
+    train_samples, val_samples, test_samples = assign_splits(sample_entries, output_root, train_ratio, val_ratio)
+    
+    # Validate the generated splits
+    validate_splits_and_metadata(train_samples, val_samples, test_samples)
+    
     # Save to JSON files
     for split_name, split_data in [('train', train_samples), ('val', val_samples), ('test', test_samples)]:
         out_file = os.path.join(output_root, f"{split_name}_metadata.json")
         with open(out_file, 'w') as f:
             json.dump(split_data, f, indent=2)
-
+            
     print(f"Dataset split saved to {output_root}: Train={len(train_samples)}, Val={len(val_samples)}, Test={len(test_samples)} frames.")
     return os.path.join(output_root, "train_metadata.json")
 
@@ -161,8 +371,6 @@ def process_faceforensics_structure(
     - manipulated_sequences/Deepfakes/c23/videos/ (fake, label 1)
     or flat directory containing mp4 files.
     """
-    print(f"Preprocessing FaceForensics++ dataset from: {videos_dir}")
-
     # Search for real videos
     real_patterns = [
         os.path.join(videos_dir, "original_sequences", "youtube", "*", "videos", "*.mp4"),
@@ -174,39 +382,85 @@ def process_faceforensics_structure(
     for pat in real_patterns:
         real_files.extend(glob.glob(pat))
 
-    # Search for fake videos (Deepfakes subset)
-    fake_patterns = [
-        os.path.join(videos_dir, "manipulated_sequences", "Deepfakes", "*", "videos", "*.mp4"),
-        os.path.join(videos_dir, "manipulated_sequences", "*", "*", "videos", "*.mp4"),
-        os.path.join(videos_dir, "Deepfakes", "*.mp4"),
-        os.path.join(videos_dir, "fake", "*.mp4"),
-    ]
-    fake_files = []
-    for pat in fake_patterns:
-        fake_files.extend(glob.glob(pat))
+    # Discover available manipulation methods and gather fakes
+    manip_root = os.path.join(videos_dir, "manipulated_sequences")
+    manip_methods = {}
+    
+    if os.path.exists(manip_root):
+        for entry in sorted(os.listdir(manip_root)):
+            entry_path = os.path.join(manip_root, entry)
+            if os.path.isdir(entry_path):
+                method_videos = []
+                for ext in ["*.mp4", "*.avi"]:
+                    method_videos.extend(glob.glob(os.path.join(entry_path, "*", "videos", ext)))
+                    method_videos.extend(glob.glob(os.path.join(entry_path, "videos", ext)))
+                    method_videos.extend(glob.glob(os.path.join(entry_path, ext)))
+                if method_videos:
+                    manip_methods[entry] = sorted(list(set(method_videos)))
+                    
+    # Fallback to general patterns if no methods directory structure found
+    if not manip_methods:
+        fake_patterns = [
+            os.path.join(videos_dir, "manipulated_sequences", "*", "*", "videos", "*.mp4"),
+            os.path.join(videos_dir, "Deepfakes", "*.mp4"),
+            os.path.join(videos_dir, "fake", "*.mp4"),
+        ]
+        fake_files = []
+        for pat in fake_patterns:
+            fake_files.extend(glob.glob(pat))
+        if fake_files:
+            manip_methods["default"] = sorted(list(set(fake_files)))
 
-    # Fallback: if flat structure
-    if not real_files and not fake_files:
+    # Fallback: if flat structure search
+    if not real_files and not manip_methods:
         all_videos = glob.glob(os.path.join(videos_dir, "**", "*.mp4"), recursive=True)
+        fake_files = []
         for v in all_videos:
             v_lower = v.lower()
             if "original" in v_lower or "real" in v_lower or "youtube" in v_lower:
                 real_files.append(v)
             else:
                 fake_files.append(v)
+        if fake_files:
+            manip_methods["default"] = sorted(list(set(fake_files)))
 
-    # Balance real and fake selection if max_videos is specified
+    # Perform reproducible balanced selection using random seed 42
+    import random
+    random_state = random.Random(42)
+    
+    real_files = sorted(list(set(real_files)))
+    random_state.shuffle(real_files)
+    
+    selected_fakes = []
+    if manip_methods:
+        for m in manip_methods:
+            random_state.shuffle(manip_methods[m])
+            
+        method_keys = sorted(list(manip_methods.keys()))
+        total_fake_needed = len(real_files)
+        if max_videos is not None and max_videos > 0:
+            total_fake_needed = max_videos // 2
+            
+        while len(selected_fakes) < total_fake_needed:
+            added_any = False
+            for m in method_keys:
+                if len(selected_fakes) >= total_fake_needed:
+                    break
+                if len(manip_methods[m]) > 0:
+                    selected_fakes.append(manip_methods[m].pop(0))
+                    added_any = True
+            if not added_any:
+                break
+                
     if max_videos is not None and max_videos > 0:
         half_max = max_videos // 2
-        selected_real = real_files[:half_max]
-        selected_fake = fake_files[:(max_videos - len(selected_real))]
-        if len(selected_fake) < half_max and len(real_files) > len(selected_real):
-            selected_real = real_files[:(max_videos - len(selected_fake))]
-        video_list = [(v, 0) for v in selected_real] + [(v, 1) for v in selected_fake]
+        selected_reals = real_files[:half_max]
+        video_list = [(v, 0) for v in selected_reals] + [(v, 1) for v in selected_fakes]
     else:
-        video_list = [(v, 0) for v in real_files] + [(v, 1) for v in fake_files]
+        video_list = [(v, 0) for v in real_files] + [(v, 1) for v in selected_fakes]
 
-    print(f"Found {len(real_files)} real videos and {len(fake_files)} fake videos (processing {len(video_list)} total).")
+    print(f"Found {len(real_files)} real videos. Selected fakes: {len(selected_fakes)} distributed across categories: {list(manip_methods.keys()) if manip_methods else []}")
+    print(f"Final selected video list for preprocessing: {len(video_list)} total.")
 
     # Initialize FaceDetector
     try:
@@ -229,7 +483,8 @@ def process_faceforensics_structure(
                 frame_rgb=frame_rgb,
                 face_detector=detector,
                 output_root=output_root,
-                use_phase=use_phase
+                use_phase=use_phase,
+                video_path=video_path
             )
             entry['label'] = label
             all_sample_entries.append(entry)
@@ -321,7 +576,8 @@ def process_local_dataset(
                 frame_rgb=frame_rgb,
                 face_detector=detector,
                 output_root=output_root,
-                use_phase=use_phase
+                use_phase=use_phase,
+                video_path=video_path
             )
             entry['label'] = label
             all_sample_entries.append(entry)

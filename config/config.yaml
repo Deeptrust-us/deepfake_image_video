@@ -65,7 +65,7 @@ training:
   early_stopping:
     patience: 10
     metric: "val_auc"
-  num_workers: 4
+  num_workers: 2
   pin_memory: true
 
 # Evaluation

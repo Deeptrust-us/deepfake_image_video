@@ -114,6 +114,7 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.5, help="Classification threshold")
     parser.add_argument("--optimal_threshold", action="store_true", help="Determine F1-optimal threshold on val set")
     parser.add_argument("--output_dir", type=str, default="results", help="Output directory for results")
+    parser.add_argument("--allow_random_weights", action="store_true", help="Allow running evaluation with initialized weights for debugging")
     args = parser.parse_args()
 
     # Resolve config path robustly
@@ -139,17 +140,42 @@ def main():
     # Initialize model using model factory
     model = get_model(args.model, config).to(device)
 
-    # Load checkpoint if provided
-    if args.checkpoint and os.path.exists(args.checkpoint):
+    # Load checkpoint if provided, otherwise fail strictly unless --allow_random_weights is specified
+    if args.checkpoint:
+        if not os.path.exists(args.checkpoint):
+            raise FileNotFoundError(f"CRITICAL ERROR: Specified checkpoint file not found at: {args.checkpoint}")
+        
         checkpoint = torch.load(args.checkpoint, map_location=device)
+        epoch = 'unknown'
+        best_val_auc = 'N/A'
+        
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-            print(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
+            state_dict = checkpoint['model_state_dict']
+            epoch = checkpoint.get('epoch', 'unknown')
+            best_val_auc = checkpoint.get('best_val_auc', 'N/A')
         elif isinstance(checkpoint, dict):
-            model.load_state_dict(checkpoint)
-            print("Loaded checkpoint state dict.")
+            state_dict = checkpoint
+        else:
+            raise ValueError(f"CRITICAL ERROR: Loaded checkpoint format is unrecognized from: {args.checkpoint}")
+            
+        # Verify compatibility of state_dict keys with model structure
+        model_keys = set(model.state_dict().keys())
+        ckpt_keys = set(state_dict.keys())
+        missing_keys = model_keys - ckpt_keys
+        unexpected_keys = ckpt_keys - model_keys
+        
+        if missing_keys:
+            print(f"Warning: Missing keys in checkpoint state_dict: {list(missing_keys)[:10]}")
+        if unexpected_keys:
+            print(f"Warning: Unexpected keys in checkpoint state_dict: {list(unexpected_keys)[:10]}")
+            
+        # Load state dict
+        model.load_state_dict(state_dict)
+        print(f"✓ Successfully loaded checkpoint from epoch {epoch} (Validation AUC: {best_val_auc})")
     else:
-        print("Note: No checkpoint specified or file not found. Running inference with initialized model weights.")
+        if not args.allow_random_weights:
+            raise ValueError("CRITICAL ERROR: No checkpoint specified! Set --checkpoint or run with --allow_random_weights for debugging.")
+        print("Note: Running inference with newly initialized model weights (debugging mode).")
 
     data_root = config['data']['data_root']
 
@@ -168,6 +194,11 @@ def main():
             )
             val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'], shuffle=False)
             if len(val_dataset) > 0:
+                val_labels = [item['label'] for item in val_dataset.samples]
+                val_real = val_labels.count(0)
+                val_fake = val_labels.count(1)
+                if val_real == 0 or val_fake == 0:
+                    raise ValueError(f"CRITICAL ERROR: Validation split is degenerate (Real={val_real}, Fake={val_fake}). Both classes must be present!")
                 _, _, val_labels, _, val_probas = evaluate_model(model, val_loader, device, video_level=False, threshold=0.5)
                 optimal_thresh = find_optimal_threshold(val_labels, val_probas)
                 print(f"Optimal threshold found: {optimal_thresh:.4f}")
@@ -185,6 +216,13 @@ def main():
     if len(dataset) == 0:
         print(f"Warning: Dataset split '{args.split}' is empty or metadata file {metadata_file} not found.")
         return
+
+    # Assert binary class balance
+    target_labels = [item['label'] for item in dataset.samples]
+    target_real = target_labels.count(0)
+    target_fake = target_labels.count(1)
+    if target_real == 0 or target_fake == 0:
+        raise ValueError(f"CRITICAL ERROR: Target split '{args.split}' is degenerate (Real={target_real}, Fake={target_fake}). Both classes must be present!")
 
     dataloader = DataLoader(
         dataset,

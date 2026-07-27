@@ -42,10 +42,23 @@ def main():
     parser.add_argument("--skip_preprocess", action="store_true", help="Skip dataset preprocessing step")
     parser.add_argument("--skip_train", action="store_true", help="Skip training and just evaluate existing checkpoints")
     parser.add_argument("--output_dir", type=str, default="results", help="Directory to save evaluation results")
+    parser.add_argument("--force_reprocess", action="store_true", help="Force regeneration of preprocessed metadata")
+    parser.add_argument("--smoke_test", action="store_true", help="Run end-to-end smoke test on a tiny balanced subset")
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent.parent
     os.chdir(project_root)
+
+    # Overrides for smoke_test mode
+    if args.smoke_test:
+        print("\n" + "=" * 60)
+        print(" RUNNING INTEGRATED E2E SMOKE TEST")
+        print("=" * 60)
+        args.epochs = 1
+        args.num_videos = 2  # Balance real/fake = 4 videos total
+        args.force_reprocess = True
+        args.split = "test"
+        args.model = "all"
 
     # 1. Dataset Downloading
     raw_dir = project_root / "data" / "faceforensics_raw"
@@ -85,10 +98,43 @@ def main():
 
     # 2. Dataset Preprocessing
     metadata_train = project_root / "data" / "train_metadata.json"
+    settings_file = project_root / "data" / "preprocessing_settings.json"
     
+    # Track current preprocessing settings to auto-detect changes
+    current_settings = {
+        "dataset_type": "faceforensics",
+        "videos_dir": str(raw_dir),
+        "frame_sampling_rate": 3,
+        "face_size": 224,
+        "use_mtcnn": True
+    }
+    
+    try:
+        import yaml
+        with open(args.config, 'r') as f:
+            cfg = yaml.safe_load(f)
+            current_settings["frame_sampling_rate"] = cfg.get('data', {}).get('frame_sampling_rate', 3)
+            current_settings["face_size"] = cfg.get('data', {}).get('face_size', 224)
+            current_settings["use_mtcnn"] = cfg.get('preprocessing', {}).get('use_mtcnn', True)
+    except Exception:
+        pass
+
+    settings_changed = False
+    if settings_file.exists():
+        try:
+            with open(settings_file, 'r') as f:
+                old_settings = json.load(f)
+                if old_settings != current_settings:
+                    print("\n⚠️  Preprocessing configuration settings changed. Forcing dataset regeneration...")
+                    settings_changed = True
+        except Exception:
+            settings_changed = True
+    else:
+        settings_changed = True
+
     # Auto-force preprocessing if existing metadata contains only one class
-    force_preprocess = False
-    if metadata_train.exists():
+    force_preprocess = args.force_reprocess or settings_changed
+    if not force_preprocess and metadata_train.exists():
         try:
             with open(metadata_train, "r") as f:
                 meta = json.load(f)
@@ -109,6 +155,15 @@ def main():
                 "--videos-dir", str(raw_dir),
                 "--max_videos", str(args.num_videos * 2)
             ], "Preprocessing Dataset (MTCNN alignment + FFT Extraction)")
+            
+            # Save settings upon successful preprocessing
+            os.makedirs(project_root / "data", exist_ok=True)
+            try:
+                with open(settings_file, 'w') as f:
+                    json.dump(current_settings, f, indent=2)
+                print("✓ Preprocessing settings cached.")
+            except Exception as e:
+                print(f"Warning: Could not save preprocessing settings cache ({e}).")
         else:
             print("\n✓ Preprocessed dataset metadata already exists. Skipping preprocessing.")
 
