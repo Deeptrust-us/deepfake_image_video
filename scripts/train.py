@@ -284,15 +284,21 @@ def main():
         train_metadata = json.load(f)
     
     train_labels = [item['label'] for item in train_metadata]
-    class_counts = np.bincount(train_labels)
     total = len(train_labels)
     
-    # Calculate weights: inverse frequency (more weight to minority class)
-    class_weights = total / (len(class_counts) * class_counts)
+    # Count occurrences safely (always size 2)
+    real_count = train_labels.count(0)
+    fake_count = train_labels.count(1)
+    class_counts = np.array([real_count, fake_count])
+    
+    # Calculate weights: inverse frequency (more weight to minority class, fallback to 1.0 if empty)
+    weight_real = total / (2 * real_count) if real_count > 0 else 1.0
+    weight_fake = total / (2 * fake_count) if fake_count > 0 else 1.0
+    class_weights = np.array([weight_real, weight_fake])
     class_weights_tensor = torch.FloatTensor(class_weights).to(device)
     
-    print(f"Class distribution: Real={class_counts[0]}, Fake={class_counts[1]}")
-    print(f"Class weights: Real={class_weights[0]:.4f}, Fake={class_weights[1]:.4f}")
+    print(f"Class distribution: Real={real_count}, Fake={fake_count}")
+    print(f"Class weights: Real={weight_real:.4f}, Fake={weight_fake:.4f}")
     
     # Choose loss function
     use_focal_loss = config['training'].get('use_focal_loss', False)
