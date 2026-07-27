@@ -44,6 +44,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default="results", help="Directory to save evaluation results")
     parser.add_argument("--force_reprocess", action="store_true", help="Force regeneration of preprocessed metadata")
     parser.add_argument("--smoke_test", action="store_true", help="Run end-to-end smoke test on a tiny balanced subset")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="List of random seeds to run over")
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent.parent
@@ -109,13 +110,19 @@ def main():
     metadata_train = project_root / "data" / "train_metadata.json"
     settings_file = project_root / "data" / "preprocessing_settings.json"
     
+    # Gather sorted raw video file names (reproducible sorting) to detect dataset changes
+    raw_videos = []
+    if raw_dir.exists():
+        raw_videos = sorted([str(p.name) for p in raw_dir.rglob("*.mp4")] + [str(p.name) for p in raw_dir.rglob("*.avi")])
+        
     # Track current preprocessing settings to auto-detect changes
     current_settings = {
         "dataset_type": "faceforensics",
         "videos_dir": str(raw_dir),
         "frame_sampling_rate": 3,
         "face_size": 224,
-        "use_mtcnn": True
+        "use_mtcnn": True,
+        "raw_video_filenames": raw_videos
     }
     
     try:
@@ -134,7 +141,7 @@ def main():
             with open(settings_file, 'r') as f:
                 old_settings = json.load(f)
                 if old_settings != current_settings:
-                    print("\n⚠️  Preprocessing configuration settings changed. Forcing dataset regeneration...")
+                    print("\n⚠️  Preprocessing configuration settings or raw video files changed. Forcing dataset regeneration...")
                     settings_changed = True
         except Exception:
             settings_changed = True
@@ -156,6 +163,12 @@ def main():
 
     if not args.skip_preprocess:
         if force_preprocess or not metadata_train.exists() or not (project_root / "data" / "test_metadata.json").exists():
+            # Update settings filenames before executing preprocess since new download might have run
+            raw_videos = []
+            if raw_dir.exists():
+                raw_videos = sorted([str(p.name) for p in raw_dir.rglob("*.mp4")] + [str(p.name) for p in raw_dir.rglob("*.avi")])
+            current_settings["raw_video_filenames"] = raw_videos
+
             run_command([
                 sys.executable,
                 str(project_root / "scripts" / "preprocess.py"),
@@ -179,56 +192,50 @@ def main():
     # Determine models to run
     models_to_run = ["xception", "rgb_fft_dual_stream"] if args.model == "all" else [args.model]
 
-    # 3. Model Training & Evaluation
-    for model_name in models_to_run:
-        # Train model
-        if not args.skip_train:
+    # results collector: model -> metric_name -> list of values
+    results_agg = {model: {m: [] for m in ['accuracy', 'f1', 'auc', 'eer']} for model in models_to_run}
+
+    for seed in args.seeds:
+        print(f"\n" + "=" * 60)
+        print(f" PIPELINE RUN WITH SEED: {seed}")
+        print("=" * 60)
+        
+        for model_name in models_to_run:
+            # 3. Model Training
+            if not args.skip_train:
+                run_command([
+                    sys.executable,
+                    str(project_root / "scripts" / "train.py"),
+                    "--model", model_name,
+                    "--config", args.config,
+                    "--epochs", str(args.epochs),
+                    "--seed", str(seed)
+                ], f"Training Model: {model_name.upper()} (Seed {seed})")
+
+            # Determine checkpoint path (suffix checkpoint name with seed value)
+            model_name_clean = model_name.lower().replace("-", "_")
+            checkpoint_path = project_root / "checkpoints" / f"best_model_{model_name_clean}_seed{seed}.pth"
+            if not checkpoint_path.exists():
+                fallback_path = project_root / "checkpoints" / f"latest_{model_name_clean}_seed{seed}.pth"
+                if fallback_path.exists():
+                    print(f"⚠️  best checkpoint not found. Falling back to latest.")
+                    checkpoint_path = fallback_path
+
+            # 4. Evaluate Model
             run_command([
                 sys.executable,
-                str(project_root / "scripts" / "train.py"),
+                str(project_root / "scripts" / "evaluate.py"),
                 "--model", model_name,
                 "--config", args.config,
-                "--epochs", str(args.epochs)
-            ], f"Training Model: {model_name.upper()} ({args.epochs} Epochs)")
+                "--checkpoint", str(checkpoint_path),
+                "--split", args.split,
+                "--optimal_threshold",
+                "--output_dir", args.output_dir,
+                "--seed", str(seed)
+            ], f"Evaluating Model: {model_name.upper()} (Seed {seed})")
 
-        # Determine checkpoint path (fallback to latest if best model is missing/not updated)
-        checkpoint_path = project_root / "checkpoints" / f"best_model_{model_name}.pth"
-        if not checkpoint_path.exists():
-            fallback_path = project_root / "checkpoints" / f"latest_{model_name}.pth"
-            if fallback_path.exists():
-                print(f"⚠️  best_model_{model_name}.pth not found. Falling back to latest_{model_name}.pth")
-                checkpoint_path = fallback_path
-
-        # Evaluate model
-        run_command([
-            sys.executable,
-            str(project_root / "scripts" / "evaluate.py"),
-            "--model", model_name,
-            "--config", args.config,
-            "--checkpoint", str(checkpoint_path),
-            "--split", args.split,
-            "--optimal_threshold",
-            "--output_dir", args.output_dir
-        ], f"Evaluating Model: {model_name.upper()}")
-
-    # 4. Generate & Display Summary Table
-    print("\n" + "=" * 60)
-    print(" PIPELINE RESULTS SUMMARY (FaceForensics++ Deepfakes, c23)")
-    print("=" * 60)
-    print(f"{'Method':<25} | {'Accuracy':<10} | {'F1-score':<10} | {'AUC':<8} | {'EER':<8}")
-    print("-" * 65)
-
-    summary_file = Path(args.output_dir) / "pipeline_summary.txt"
-    with open(summary_file, "w") as sf:
-        sf.write("=" * 60 + "\n")
-        sf.write(" PIPELINE RESULTS SUMMARY (FaceForensics++ Deepfakes, c23)\n")
-        sf.write("=" * 60 + "\n")
-        sf.write(f"{'Method':<25} | {'Accuracy':<10} | {'F1-score':<10} | {'AUC':<8} | {'EER':<8}\n")
-        sf.write("-" * 65 + "\n")
-
-        # Read results files
-        for model_name in models_to_run:
-            results_path = Path(args.output_dir) / f"{model_name}_{args.split}_results.txt"
+            # Parse results
+            results_path = Path(args.output_dir) / f"{model_name_clean}_{args.split}_results_seed{seed}.txt"
             if results_path.exists():
                 metrics = {}
                 with open(results_path, "r") as rf:
@@ -236,22 +243,80 @@ def main():
                         if ":" in line:
                             parts = line.split(":")
                             key = parts[0].strip().lower()
-                            val = parts[1].strip()
-                            metrics[key] = val
+                            try:
+                                val_str = parts[1].strip().replace('%', '')
+                                val = float(val_str)
+                                metrics[key] = val
+                            except ValueError:
+                                pass
+                
+                for m in ['accuracy', 'f1', 'auc', 'eer']:
+                    if m in metrics:
+                        val = metrics[m]
+                        # Scale down percentage values to [0,1]
+                        if m in ['accuracy', 'f1', 'eer'] and val > 1.0:
+                            val /= 100.0
+                        results_agg[model_name][m].append(val)
 
-                model_disp_name = "Xception (baseline)" if model_name == "xception" else "RGB+FFT dual-stream"
-                accuracy = metrics.get("accuracy", "N/A")
-                f1_score = metrics.get("f1-score", "N/A")
-                auc = metrics.get("auc", "N/A")
-                eer = metrics.get("eer", "N/A")
+    # 4. Generate & Display Summary Table
+    import math
 
-                row = f"{model_disp_name:<25} | {accuracy:<10} | {f1_score:<10} | {auc:<8} | {eer:<8}"
-                print(row)
-                sf.write(row + "\n")
+    def mean_std(values):
+        if not values:
+            return "N/A", "N/A"
+        n = len(values)
+        mean = sum(values) / n
+        if n > 1:
+            variance = sum((x - mean) ** 2 for x in values) / (n - 1)
+        else:
+            variance = 0.0
+        std = math.sqrt(variance)
+        return mean, std
 
-    print("-" * 65)
+    print("\n" + "=" * 80)
+    print(" PIPELINE RESULTS SUMMARY (FaceForensics++ Deepfakes, c23)")
+    print(f" Aggregated across seeds: {args.seeds}")
+    print("=" * 80)
+    print(f"{'Method':<25} | {'Accuracy':<16} | {'F1-score':<16} | {'AUC':<16} | {'EER':<16}")
+    print("-" * 101)
+
+    summary_file = Path(args.output_dir) / "pipeline_summary.txt"
+    with open(summary_file, "w") as sf:
+        sf.write("=" * 80 + "\n")
+        sf.write(" PIPELINE RESULTS SUMMARY (FaceForensics++ Deepfakes, c23)\n")
+        sf.write(f" Aggregated across seeds: {args.seeds}\n")
+        sf.write("=" * 80 + "\n")
+        sf.write(f"{'Method':<25} | {'Accuracy':<16} | {'F1-score':<16} | {'AUC':<16} | {'EER':<16}\n")
+        sf.write("-" * 101 + "\n")
+
+        for model_name in models_to_run:
+            model_disp_name = "Xception (baseline)" if model_name == "xception" else "RGB+FFT dual-stream"
+            
+            acc_m, acc_s = mean_std(results_agg[model_name]['accuracy'])
+            f1_m, f1_s = mean_std(results_agg[model_name]['f1'])
+            auc_m, auc_s = mean_std(results_agg[model_name]['auc'])
+            eer_m, eer_s = mean_std(results_agg[model_name]['eer'])
+
+            def format_metric(m, s, is_percent=True):
+                if m == "N/A":
+                    return "N/A"
+                if is_percent:
+                    return f"{m*100:.2f}% ± {s*100:.2f}%"
+                else:
+                    return f"{m:.4f} ± {s:.4f}"
+
+            acc_str = format_metric(acc_m, acc_s, is_percent=True)
+            f1_str = format_metric(f1_m, f1_s, is_percent=True)
+            auc_str = format_metric(auc_m, auc_s, is_percent=False)
+            eer_str = format_metric(eer_m, eer_s, is_percent=True)
+
+            row = f"{model_disp_name:<25} | {acc_str:<16} | {f1_str:<16} | {auc_str:<16} | {eer_str:<16}"
+            print(row)
+            sf.write(row + "\n")
+
+    print("-" * 101)
     print(f"\nConsolidated results saved to: {summary_file}")
-    print("=" * 60)
+    print("=" * 80)
 
 
 if __name__ == "__main__":

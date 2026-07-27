@@ -115,6 +115,7 @@ def main():
     parser.add_argument("--optimal_threshold", action="store_true", help="Determine F1-optimal threshold on val set")
     parser.add_argument("--output_dir", type=str, default="results", help="Output directory for results")
     parser.add_argument("--allow_random_weights", action="store_true", help="Allow running evaluation with initialized weights for debugging")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for replication")
     args = parser.parse_args()
 
     # Resolve config path robustly
@@ -136,6 +137,19 @@ def main():
     print(f"Evaluating Model: {args.model}")
 
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Resolve default checkpoint path if not provided
+    if not args.checkpoint:
+        model_name_clean = args.model.lower().replace("-", "_")
+        default_ckpt = os.path.join(config['paths']['checkpoint_dir'], f"best_model_{model_name_clean}_seed{args.seed}.pth")
+        if os.path.exists(default_ckpt):
+            args.checkpoint = default_ckpt
+            print(f"✓ Using default seed-specific checkpoint path: {args.checkpoint}")
+        else:
+            std_ckpt = os.path.join(config['paths']['checkpoint_dir'], f"best_model_{model_name_clean}.pth")
+            if os.path.exists(std_ckpt):
+                args.checkpoint = std_ckpt
+                print(f"✓ Using default checkpoint path: {args.checkpoint}")
 
     # Initialize model using model factory
     model = get_model(args.model, config).to(device)
@@ -260,20 +274,25 @@ def main():
 
     # Save results
     model_tag = args.model.lower().replace("-", "_")
-    results_file = os.path.join(args.output_dir, f"{model_tag}_{args.split}_results.txt")
-    with open(results_file, 'w') as f:
-        f.write(f"Model: {args.model}\n")
-        f.write(f"Split: {args.split}\n")
-        f.write(f"Threshold: {optimal_thresh:.4f}\n\n")
-        f.write("Frame-level Metrics:\n")
-        f.write(f"Accuracy: {frame_metrics['accuracy']*100:.2f}%\n")
-        f.write(f"F1-score: {frame_metrics['f1']*100:.2f}%\n")
-        f.write(f"AUC: {frame_metrics['auc']:.4f}\n")
-        f.write(f"EER: {frame_metrics['eer']*100:.2f}%\n")
-        for key, value in frame_metrics.items():
-            f.write(f"{key}: {value:.4f}\n")
+    results_file = os.path.join(args.output_dir, f"{model_tag}_{args.split}_results_seed{args.seed}.txt")
+    legacy_file = os.path.join(args.output_dir, f"{model_tag}_{args.split}_results.txt")
+    
+    # Save seed-specific metrics file
+    for filepath in [results_file, legacy_file]:
+        with open(filepath, 'w') as f:
+            f.write(f"Model: {args.model}\n")
+            f.write(f"Split: {args.split}\n")
+            f.write(f"Seed: {args.seed}\n")
+            f.write(f"Threshold: {optimal_thresh:.4f}\n\n")
+            f.write("Frame-level Metrics:\n")
+            f.write(f"Accuracy: {frame_metrics['accuracy']*100:.2f}%\n")
+            f.write(f"F1-score: {frame_metrics['f1']*100:.2f}%\n")
+            f.write(f"AUC: {frame_metrics['auc']:.4f}\n")
+            f.write(f"EER: {frame_metrics['eer']*100:.2f}%\n")
+            for key, value in frame_metrics.items():
+                f.write(f"{key}: {value:.4f}\n")
 
-    cm_path = os.path.join(args.output_dir, f"{model_tag}_{args.split}_confusion_matrix.png")
+    cm_path = os.path.join(args.output_dir, f"{model_tag}_{args.split}_confusion_matrix_seed{args.seed}.png")
     plot_confusion_matrix(y_true, y_pred, cm_path)
 
     print(f"\nSaved evaluation metrics to: {results_file}")

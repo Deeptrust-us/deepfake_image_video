@@ -131,12 +131,18 @@ class DeepfakeDataset(Dataset):
         frame_rgb = self._load_image(frame_path)
 
         # Apply spatial data augmentations during training if specified
+        is_augmented = False
         if self.is_training and self.augmentations is not None:
             face_rgb, frame_rgb = self.augmentations(face_rgb, frame_rgb)
+            is_augmented = True
 
         # Load frequency representations (after spatial augmentations)
-        face_freq = self._load_frequency(item.get('face_frequency_path', ''), face_rgb)
-        frame_freq = self._load_frequency(item.get('frame_frequency_path', item.get('frequency_path', '')), frame_rgb)
+        # If augmented during training, bypass pre-computed file to compute matching FFT on the fly!
+        face_freq_path = '' if is_augmented else item.get('face_frequency_path', '')
+        frame_freq_path = '' if is_augmented else item.get('frame_frequency_path', item.get('frequency_path', ''))
+
+        face_freq = self._load_frequency(face_freq_path, face_rgb)
+        frame_freq = self._load_frequency(frame_freq_path, frame_rgb)
 
         # Convert RGB images to Tensors & apply normalization and cast to float32
         face_spatial_tensor = self.transform(face_rgb).float()

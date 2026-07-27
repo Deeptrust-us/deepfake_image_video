@@ -131,7 +131,17 @@ def main():
                         help="Model architecture to train")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--epochs", type=int, default=None, help="Override number of training epochs")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for replication")
     args = parser.parse_args()
+    
+    # Set random seeds for reproducibility
+    import random
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    print(f"✓ Initialized random seed: {args.seed}")
     
     # Resolve config path robustly
     config_path = args.config
@@ -234,6 +244,12 @@ def main():
     
     # Create dataloaders with optional oversampling for real videos
     oversample_real = config['training'].get('oversample_real', False)
+    if oversample_real:
+        # Check if the class counts are already balanced
+        if train_real == train_fake:
+            print("✓ Training split is already balanced (50/50). Oversampling is disabled to avoid bias and sampling noise.")
+            oversample_real = False
+            
     if oversample_real:
         from torch.utils.data import WeightedRandomSampler
         # Calculate sample weights: higher weight for real videos (label=0)
@@ -417,8 +433,35 @@ def main():
         print(f"  Train - Loss: {train_metrics['loss']:.4f}, AUC: {train_metrics['auc']:.4f}, F1: {train_metrics['f1']:.4f}")
         print(f"  Val   - Loss: {val_metrics['loss']:.4f}, AUC: {val_metrics['auc']:.4f}, F1: {val_metrics['f1']:.4f}")
         
-        # Save checkpoint
-        checkpoint = {
+        # Define checkpoint file names (with seed suffix for reproducibility and seed aggregation)
+        model_name_clean = args.model.lower().replace("-", "_")
+        best_filename = f'best_model_{model_name_clean}_seed{args.seed}.pth'
+        latest_filename = f'latest_{model_name_clean}_seed{args.seed}.pth'
+        
+        best_path = os.path.abspath(os.path.join(config['paths']['checkpoint_dir'], best_filename))
+        latest_path = os.path.abspath(os.path.join(config['paths']['checkpoint_dir'], latest_filename))
+        
+        # Save best model
+        if val_metrics['auc'] > best_val_auc:
+            best_val_auc = val_metrics['auc']
+            patience_counter = 0
+            
+            # Construct checkpoint dict AFTER updating best_val_auc so metadata matches exactly!
+            checkpoint = {
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_val_auc': best_val_auc,
+                'val_metrics': val_metrics
+            }
+            torch.save(checkpoint, best_path)
+            print(f"  ✓ Saved best model checkpoint to: {best_path} (AUC: {best_val_auc:.4f})")
+        else:
+            patience_counter += 1
+        
+        # Save latest checkpoint
+        latest_checkpoint = {
             'epoch': epoch + 1,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
@@ -426,22 +469,7 @@ def main():
             'best_val_auc': best_val_auc,
             'val_metrics': val_metrics
         }
-        
-        # Save best model
-        model_name_clean = args.model.lower().replace("-", "_")
-        best_path = os.path.abspath(os.path.join(config['paths']['checkpoint_dir'], f'best_model_{model_name_clean}.pth'))
-        latest_path = os.path.abspath(os.path.join(config['paths']['checkpoint_dir'], f'latest_{model_name_clean}.pth'))
-        
-        if val_metrics['auc'] > best_val_auc:
-            best_val_auc = val_metrics['auc']
-            torch.save(checkpoint, best_path)
-            patience_counter = 0
-            print(f"  ✓ Saved best model checkpoint to: {best_path} (AUC: {best_val_auc:.4f})")
-        else:
-            patience_counter += 1
-        
-        # Save latest checkpoint
-        torch.save(checkpoint, latest_path)
+        torch.save(latest_checkpoint, latest_path)
         print(f"  ✓ Saved latest model checkpoint to: {latest_path}")
         
         # Early stopping
