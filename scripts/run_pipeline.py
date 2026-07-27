@@ -55,19 +55,28 @@ def main():
         print(" RUNNING INTEGRATED E2E SMOKE TEST")
         print("=" * 60)
         args.epochs = 1
-        args.num_videos = 2  # Balance real/fake = 4 videos total
+        args.num_videos = 3  # Balance real/fake = 6 videos total
         args.force_reprocess = True
         args.split = "test"
         args.model = "all"
 
-    # 1. Dataset Downloading
     raw_dir = project_root / "data" / "faceforensics_raw"
     if not args.skip_download:
-        # Check if videos exist
-        videos_exist = len(list(raw_dir.rglob("*.mp4"))) > 0
-        if not videos_exist:
+        # Check if enough videos exist per category
+        reals_existing = list((raw_dir / "original_sequences").rglob("*.mp4"))
+        fakes_existing = list((raw_dir / "manipulated_sequences").rglob("*.mp4"))
+        
+        # If flat structure check
+        if not reals_existing and not fakes_existing:
+            all_videos = list(raw_dir.rglob("*.mp4"))
+            reals_existing = [v for v in all_videos if "original" in str(v).lower() or "real" in str(v).lower()]
+            fakes_existing = [v for v in all_videos if v not in reals_existing]
+            
+        needs_download = (len(reals_existing) < args.num_videos) or (len(fakes_existing) < args.num_videos)
+        
+        if needs_download:
             os.makedirs(raw_dir, exist_ok=True)
-            print("\nDataset missing. Initiating download...")
+            print(f"\nDataset incomplete (Found: {len(reals_existing)} real, {len(fakes_existing)} fake; Needed: {args.num_videos} of each). Initiating download...")
             # Download Deepfakes
             run_command([
                 sys.executable,
@@ -94,7 +103,7 @@ def main():
                 "-y"
             ], "Downloading FaceForensics++ Original Subset")
         else:
-            print("\n✓ Raw videos already exist in data/faceforensics_raw. Skipping download.")
+            print(f"\n✓ Sufficient raw videos already exist in data/faceforensics_raw ({len(reals_existing)} real, {len(fakes_existing)} fake). Skipping download.")
 
     # 2. Dataset Preprocessing
     metadata_train = project_root / "data" / "train_metadata.json"
