@@ -145,7 +145,10 @@ def main():
         if not os.path.exists(args.checkpoint):
             raise FileNotFoundError(f"CRITICAL ERROR: Specified checkpoint file not found at: {args.checkpoint}")
         
-        checkpoint = torch.load(args.checkpoint, map_location=device)
+        try:
+            checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(args.checkpoint, map_location=device)
         epoch = 'unknown'
         best_val_auc = 'N/A'
         

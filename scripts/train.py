@@ -380,7 +380,10 @@ def main():
     
     # Resume from checkpoint if specified
     if args.resume:
-        checkpoint = torch.load(args.resume)
+        try:
+            checkpoint = torch.load(args.resume, weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(args.resume)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
