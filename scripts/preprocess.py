@@ -74,13 +74,18 @@ def main():
         # Local dataset
         videos_dir = args.videos_dir or config['data'].get('raw_videos_dir', 'data/raw')
         
-        if not os.path.exists(videos_dir):
-            print(f"Error: Videos directory not found: {videos_dir}")
-            print("\nTo use local datasets:")
-            print("1. Download Celeb-DF v2 or FaceForensics++")
-            print("2. Place videos in data/raw/")
-            print("3. Run: python preprocess.py --dataset-type celebdf --videos-dir data/raw")
-            return
+        # Ensure videos_dir directory exists
+        os.makedirs(videos_dir, exist_ok=True)
+
+        # Check if videos exist
+        import glob
+        video_files = glob.glob(os.path.join(videos_dir, "**", "*.mp4"), recursive=True) + \
+                      glob.glob(os.path.join(videos_dir, "**", "*.avi"), recursive=True)
+
+        if len(video_files) == 0:
+            print(f"⚠️  Warning: No video files (.mp4/.avi) found in: {videos_dir}")
+            print("   Please ensure you have downloaded the dataset (Step 2) before running preprocessing.")
+            print(f"   Expected directory structure: {videos_dir}/original_sequences/ and {videos_dir}/manipulated_sequences/")
         
         if dataset_type == "celebdf":
             metadata_file = process_celebdf_structure(
