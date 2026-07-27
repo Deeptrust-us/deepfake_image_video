@@ -195,10 +195,16 @@ def process_faceforensics_structure(
             else:
                 fake_files.append(v)
 
-    video_list = [(v, 0) for v in real_files] + [(v, 1) for v in fake_files]
-
+    # Balance real and fake selection if max_videos is specified
     if max_videos is not None and max_videos > 0:
-        video_list = video_list[:max_videos]
+        half_max = max_videos // 2
+        selected_real = real_files[:half_max]
+        selected_fake = fake_files[:(max_videos - len(selected_real))]
+        if len(selected_fake) < half_max and len(real_files) > len(selected_real):
+            selected_real = real_files[:(max_videos - len(selected_fake))]
+        video_list = [(v, 0) for v in selected_real] + [(v, 1) for v in selected_fake]
+    else:
+        video_list = [(v, 0) for v in real_files] + [(v, 1) for v in fake_files]
 
     print(f"Found {len(real_files)} real videos and {len(fake_files)} fake videos (processing {len(video_list)} total).")
 
@@ -266,10 +272,9 @@ def process_local_dataset(
     all_videos = glob.glob(os.path.join(videos_dir, "**", "*.mp4"), recursive=True) + \
                  glob.glob(os.path.join(videos_dir, "**", "*.avi"), recursive=True)
 
-    if max_videos is not None and max_videos > 0:
-        all_videos = all_videos[:max_videos]
-
-    video_list = []
+    real_videos = []
+    fake_videos = []
+    
     for v_path in all_videos:
         label = 1  # Default fake
         if label_mapping:
@@ -281,8 +286,21 @@ def process_local_dataset(
             v_lower = v_path.lower()
             if "real" in v_lower or "original" in v_lower:
                 label = 0
+        if label == 0:
+            real_videos.append((v_path, 0))
+        else:
+            fake_videos.append((v_path, 1))
 
-        video_list.append((v_path, label))
+    # Balance selection if max_videos is specified
+    if max_videos is not None and max_videos > 0:
+        half_max = max_videos // 2
+        selected_real = real_videos[:half_max]
+        selected_fake = fake_videos[:(max_videos - len(selected_real))]
+        if len(selected_fake) < half_max and len(real_videos) > len(selected_real):
+            selected_real = real_videos[:(max_videos - len(selected_fake))]
+        video_list = selected_real + selected_fake
+    else:
+        video_list = real_videos + fake_videos
 
     try:
         detector = FaceDetector(device=device)

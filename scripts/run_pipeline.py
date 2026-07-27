@@ -85,8 +85,22 @@ def main():
 
     # 2. Dataset Preprocessing
     metadata_train = project_root / "data" / "train_metadata.json"
+    
+    # Auto-force preprocessing if existing metadata contains only one class
+    force_preprocess = False
+    if metadata_train.exists():
+        try:
+            with open(metadata_train, "r") as f:
+                meta = json.load(f)
+                labels = {item['label'] for item in meta}
+                if len(labels) < 2:
+                    print("\n⚠️  Existing preprocessed metadata contains only 1 class. Forcing balanced preprocessing...")
+                    force_preprocess = True
+        except Exception:
+            force_preprocess = True
+
     if not args.skip_preprocess:
-        if not metadata_train.exists() or not (project_root / "data" / "test_metadata.json").exists():
+        if force_preprocess or not metadata_train.exists() or not (project_root / "data" / "test_metadata.json").exists():
             run_command([
                 sys.executable,
                 str(project_root / "scripts" / "preprocess.py"),
@@ -103,8 +117,6 @@ def main():
 
     # 3. Model Training & Evaluation
     for model_name in models_to_run:
-        checkpoint_path = project_root / "checkpoints" / f"best_model_{model_name}.pth"
-
         # Train model
         if not args.skip_train:
             run_command([
@@ -114,6 +126,14 @@ def main():
                 "--config", args.config,
                 "--epochs", str(args.epochs)
             ], f"Training Model: {model_name.upper()} ({args.epochs} Epochs)")
+
+        # Determine checkpoint path (fallback to latest if best model is missing/not updated)
+        checkpoint_path = project_root / "checkpoints" / f"best_model_{model_name}.pth"
+        if not checkpoint_path.exists():
+            fallback_path = project_root / "checkpoints" / f"latest_{model_name}.pth"
+            if fallback_path.exists():
+                print(f"⚠️  best_model_{model_name}.pth not found. Falling back to latest_{model_name}.pth")
+                checkpoint_path = fallback_path
 
         # Evaluate model
         run_command([
