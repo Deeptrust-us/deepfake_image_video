@@ -26,57 +26,22 @@ cd "$WORK_DIR"
 echo "1. Installing Python dependencies..."
 pip install -q -r "$WORK_DIR/requirements.txt"
 
-# 2. Download FaceForensics++ Subset
-echo "2. Downloading FaceForensics++ (Deepfakes, c23 compression, num_videos=${NUM_VIDEOS})..."
-mkdir -p "$WORK_DIR/data/faceforensics_raw"
+# 2. Run Integrated Pipeline
+echo "2. Running Integrated Pipeline..."
+python "$WORK_DIR/scripts/run_pipeline.py" \
+    --model all \
+    --epochs 1 \
+    --num_videos "$NUM_VIDEOS" \
+    --server "$SERVER"
 
-python "$WORK_DIR/scripts/download/download_faceforensics.py" "$WORK_DIR/data/faceforensics_raw" \
-    -d Deepfakes \
-    -c c23 \
-    -t videos \
-    -n ${NUM_VIDEOS} \
-    --server ${SERVER}
-
-python "$WORK_DIR/scripts/download/download_faceforensics.py" "$WORK_DIR/data/faceforensics_raw" \
-    -d original \
-    -c c23 \
-    -t videos \
-    -n ${NUM_VIDEOS} \
-    --server ${SERVER}
-
-# 3. Preprocess Dataset
-echo "3. Preprocessing FaceForensics++ frames and faces..."
-python "$WORK_DIR/scripts/preprocess.py" \
-    --config "$WORK_DIR/config/config.yaml" \
-    --dataset-type faceforensics \
-    --videos-dir "$WORK_DIR/data/faceforensics_raw" \
-    --max_videos $((NUM_VIDEOS * 2))
-
-# 4. Evaluate Xception Baseline Model
-echo "4. Running Evaluation: Xception (baseline)..."
-python "$WORK_DIR/scripts/evaluate.py" \
-    --model xception \
-    --config "$WORK_DIR/config/config.yaml" \
-    --split test \
-    --optimal_threshold \
-    --output_dir "$WORK_DIR/results"
-
-# 5. Evaluate RGB+FFT Dual-Stream Model
-echo "5. Running Evaluation: RGB+FFT Dual-Stream..."
-python "$WORK_DIR/scripts/evaluate.py" \
-    --model rgb_fft_dual_stream \
-    --config "$WORK_DIR/config/config.yaml" \
-    --split test \
-    --optimal_threshold \
-    --output_dir "$WORK_DIR/results"
-
-# 6. Package Logs and Results
-echo "6. Packaging logs and evaluation results..."
+# 3. Package Logs and Results
+echo "3. Packaging logs and evaluation results..."
 mkdir -p "$WORK_DIR/evaluation_logs"
 cp -r "$WORK_DIR/results/" "$WORK_DIR/evaluation_logs/"
 cp -r "$WORK_DIR/logs/" "$WORK_DIR/evaluation_logs/" 2>/dev/null || true
 tar -czf "$WORK_DIR/faceforensics_evaluation_logs.tar.gz" "$WORK_DIR/evaluation_logs/"
 
 echo "========================================================================"
-echo " Evaluation Complete! Results saved to $WORK_DIR/results and $WORK_DIR/faceforensics_evaluation_logs.tar.gz"
+echo " Evaluation Complete! Summary results are in results/pipeline_summary.txt"
+echo " Package saved to $WORK_DIR/faceforensics_evaluation_logs.tar.gz"
 echo "========================================================================"

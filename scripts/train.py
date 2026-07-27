@@ -130,6 +130,7 @@ def main():
                         choices=["xception", "rgb_fft_dual_stream", "two_stream", "quad_stream"],
                         help="Model architecture to train")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--epochs", type=int, default=None, help="Override number of training epochs")
     args = parser.parse_args()
     
     # Resolve config path robustly
@@ -144,6 +145,10 @@ def main():
     # Load config
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
+        
+    if args.epochs is not None:
+        config['training']['num_epochs'] = args.epochs
+        print(f"✓ Overriding num_epochs to {args.epochs}")
     
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -389,16 +394,17 @@ def main():
         }
         
         # Save best model
+        model_name_clean = args.model.lower().replace("-", "_")
         if val_metrics['auc'] > best_val_auc:
             best_val_auc = val_metrics['auc']
-            torch.save(checkpoint, os.path.join(config['paths']['checkpoint_dir'], 'best_model.pth'))
+            torch.save(checkpoint, os.path.join(config['paths']['checkpoint_dir'], f'best_model_{model_name_clean}.pth'))
             patience_counter = 0
             print(f"  ✓ Saved best model (AUC: {best_val_auc:.4f})")
         else:
             patience_counter += 1
         
         # Save latest checkpoint
-        torch.save(checkpoint, os.path.join(config['paths']['checkpoint_dir'], 'latest.pth'))
+        torch.save(checkpoint, os.path.join(config['paths']['checkpoint_dir'], f'latest_{model_name_clean}.pth'))
         
         # Early stopping
         if patience_counter >= config['training']['early_stopping']['patience']:
