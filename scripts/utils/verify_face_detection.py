@@ -34,6 +34,23 @@ def test_face_detection():
     assert all(r is None for r in res_batch), "All results should be None"
     print("✓ Batch detection test passed.")
     
+    # Test parallel preprocessing helper
+    print("Testing parallel preprocessing helper with non-existent videos...")
+    from src.data.local_preprocessing import process_video_list_parallel
+    dummy_videos = [("non_existent_video_1.mp4", 0), ("non_existent_video_2.mp4", 1)]
+    
+    # This should run in parallel, fail to decode, and return empty list without crashing
+    res_parallel = process_video_list_parallel(
+        video_list=dummy_videos,
+        output_root="data_test",
+        fps=3,
+        use_phase=False,
+        device=device,
+        video_id_prefix="test"
+    )
+    assert len(res_parallel) == 0, f"Expected 0 entries, got {len(res_parallel)}"
+    print("✓ Parallel preprocessing helper test passed.")
+    
     print("\n✅ Verification script completed successfully!")
 
 if __name__ == "__main__":

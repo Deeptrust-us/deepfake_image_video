@@ -6,6 +6,7 @@ import glob
 import cv2
 import numpy as np
 import torch
+import torch.multiprocessing as mp
 from tqdm import tqdm
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -110,6 +111,94 @@ def save_processed_sample(
         'frequency_path': rel_freq,
         'video_path': video_path
     }
+
+
+# Global variable for worker process's FaceDetector
+worker_detector = None
+
+def init_worker(device):
+    global worker_detector
+    try:
+        worker_detector = FaceDetector(device=device)
+    except Exception:
+        worker_detector = None
+
+def process_video_worker(args):
+    video_path, label, output_root, fps, use_phase, video_id_prefix = args
+    global worker_detector
+    
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    video_id = f"{video_id_prefix}_{label}_{video_name}"
+    
+    try:
+        frames = extract_frames_from_video(video_path, target_fps=fps)
+        if not frames:
+            return []
+            
+        # Run batched face detection on the worker's FaceDetector
+        if worker_detector is not None:
+            images_rgb = [f[1] for f in frames]
+            face_crops = worker_detector.detect_batch(images_rgb)
+        else:
+            face_crops = [None] * len(frames)
+            
+        sample_entries = []
+        for (frame_idx, frame_rgb), face_crop in zip(frames, face_crops):
+            entry = save_processed_sample(
+                video_id=video_id,
+                frame_idx=frame_idx,
+                frame_rgb=frame_rgb,
+                face_detector=None,
+                output_root=output_root,
+                use_phase=use_phase,
+                video_path=video_path,
+                face_crop=face_crop
+            )
+            entry['label'] = label
+            sample_entries.append(entry)
+            
+        return sample_entries
+    except Exception as e:
+        print(f"\nError processing video {video_path}: {e}")
+        return []
+
+def process_video_list_parallel(
+    video_list: List[Tuple[str, int]],
+    output_root: str,
+    fps: int,
+    use_phase: bool,
+    device: str,
+    video_id_prefix: str = "ffpp"
+) -> List[Dict[str, Any]]:
+    """Process a list of videos in parallel using a pool of worker processes."""
+    # Use spawn start method for CUDA compatibility
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+        
+    num_workers = min(4, os.cpu_count() or 1)
+    if device == "cpu":
+        num_workers = min(8, os.cpu_count() or 1)
+        
+    print(f"\n🚀 Initializing {num_workers} parallel worker processes on device '{device}'...")
+    
+    worker_args = [
+        (video_path, label, output_root, fps, use_phase, video_id_prefix)
+        for video_path, label in video_list
+    ]
+    
+    all_sample_entries = []
+    
+    with mp.Pool(processes=num_workers, initializer=init_worker, initargs=(device,)) as pool:
+        for results in tqdm(
+            pool.imap_unordered(process_video_worker, worker_args),
+            total=len(video_list),
+            desc=f"Processing {video_id_prefix.upper()} videos"
+        ):
+            all_sample_entries.extend(results)
+            
+    return all_sample_entries
 
 
 import urllib.request
@@ -583,43 +672,14 @@ def process_faceforensics_structure(
         
     print(f"Final selected video list for preprocessing: {len(video_list)} total.")
 
-    # Initialize FaceDetector
-    try:
-        detector = FaceDetector(device=device)
-    except Exception as e:
-        print(f"Warning: Could not initialize FaceDetector ({e}). Falling back to resizing.")
-        detector = None
-
-    all_sample_entries = []
-
-    for video_path, label in tqdm(video_list, desc="Processing FF++ videos"):
-        video_name = os.path.splitext(os.path.basename(video_path))[0]
-        video_id = f"ffpp_{label}_{video_name}"
-
-        frames = extract_frames_from_video(video_path, target_fps=fps)
-        if not frames:
-            continue
-
-        # Batch face detection for the entire video (32 frames)
-        if detector is not None:
-            images_rgb = [f[1] for f in frames]
-            face_crops = detector.detect_batch(images_rgb)
-        else:
-            face_crops = [None] * len(frames)
-
-        for (frame_idx, frame_rgb), face_crop in zip(frames, face_crops):
-            entry = save_processed_sample(
-                video_id=video_id,
-                frame_idx=frame_idx,
-                frame_rgb=frame_rgb,
-                face_detector=None,
-                output_root=output_root,
-                use_phase=use_phase,
-                video_path=video_path,
-                face_crop=face_crop
-            )
-            entry['label'] = label
-            all_sample_entries.append(entry)
+    all_sample_entries = process_video_list_parallel(
+        video_list=video_list,
+        output_root=output_root,
+        fps=fps,
+        use_phase=use_phase,
+        device=device,
+        video_id_prefix="ffpp"
+    )
 
     return split_and_save_metadata(all_sample_entries, output_root)
 
@@ -689,40 +749,13 @@ def process_local_dataset(
     else:
         video_list = real_videos + fake_videos
 
-    try:
-        detector = FaceDetector(device=device)
-    except Exception:
-        detector = None
-
-    all_sample_entries = []
-
-    for video_path, label in tqdm(video_list, desc="Processing videos"):
-        video_name = os.path.splitext(os.path.basename(video_path))[0]
-        video_id = f"local_{label}_{video_name}"
-
-        frames = extract_frames_from_video(video_path, target_fps=fps)
-        if not frames:
-            continue
-
-        # Batch face detection for the entire video (32 frames)
-        if detector is not None:
-            images_rgb = [f[1] for f in frames]
-            face_crops = detector.detect_batch(images_rgb)
-        else:
-            face_crops = [None] * len(frames)
-
-        for (frame_idx, frame_rgb), face_crop in zip(frames, face_crops):
-            entry = save_processed_sample(
-                video_id=video_id,
-                frame_idx=frame_idx,
-                frame_rgb=frame_rgb,
-                face_detector=None,
-                output_root=output_root,
-                use_phase=use_phase,
-                video_path=video_path,
-                face_crop=face_crop
-            )
-            entry['label'] = label
-            all_sample_entries.append(entry)
+    all_sample_entries = process_video_list_parallel(
+        video_list=video_list,
+        output_root=output_root,
+        fps=fps,
+        use_phase=use_phase,
+        device=device,
+        video_id_prefix="local"
+    )
 
     return split_and_save_metadata(all_sample_entries, output_root)
