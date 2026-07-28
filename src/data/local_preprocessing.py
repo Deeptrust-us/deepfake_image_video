@@ -55,7 +55,8 @@ def save_processed_sample(
     face_detector: Optional[FaceDetector],
     output_root: str,
     use_phase: bool = False,
-    video_path: str = ""
+    video_path: str = "",
+    face_crop: Optional[np.ndarray] = None
 ) -> Dict[str, Any]:
     """Process single frame: detect face, compute frequency, save files, return metadata entry."""
     frames_dir = os.path.join(output_root, "frames", video_id)
@@ -76,8 +77,7 @@ def save_processed_sample(
     cv2.imwrite(frame_file, cv2.cvtColor(frame_224, cv2.COLOR_RGB2BGR))
 
     # Detect face or fallback to full frame
-    face_crop = None
-    if face_detector is not None:
+    if face_crop is None and face_detector is not None:
         try:
             face_crop = face_detector.detect_and_align(frame_rgb)
         except Exception:
@@ -597,15 +597,26 @@ def process_faceforensics_structure(
         video_id = f"ffpp_{label}_{video_name}"
 
         frames = extract_frames_from_video(video_path, target_fps=fps)
-        for frame_idx, frame_rgb in frames:
+        if not frames:
+            continue
+
+        # Batch face detection for the entire video (32 frames)
+        if detector is not None:
+            images_rgb = [f[1] for f in frames]
+            face_crops = detector.detect_batch(images_rgb)
+        else:
+            face_crops = [None] * len(frames)
+
+        for (frame_idx, frame_rgb), face_crop in zip(frames, face_crops):
             entry = save_processed_sample(
                 video_id=video_id,
                 frame_idx=frame_idx,
                 frame_rgb=frame_rgb,
-                face_detector=detector,
+                face_detector=None,
                 output_root=output_root,
                 use_phase=use_phase,
-                video_path=video_path
+                video_path=video_path,
+                face_crop=face_crop
             )
             entry['label'] = label
             all_sample_entries.append(entry)
@@ -690,15 +701,26 @@ def process_local_dataset(
         video_id = f"local_{label}_{video_name}"
 
         frames = extract_frames_from_video(video_path, target_fps=fps)
-        for frame_idx, frame_rgb in frames:
+        if not frames:
+            continue
+
+        # Batch face detection for the entire video (32 frames)
+        if detector is not None:
+            images_rgb = [f[1] for f in frames]
+            face_crops = detector.detect_batch(images_rgb)
+        else:
+            face_crops = [None] * len(frames)
+
+        for (frame_idx, frame_rgb), face_crop in zip(frames, face_crops):
             entry = save_processed_sample(
                 video_id=video_id,
                 frame_idx=frame_idx,
                 frame_rgb=frame_rgb,
-                face_detector=detector,
+                face_detector=None,
                 output_root=output_root,
                 use_phase=use_phase,
-                video_path=video_path
+                video_path=video_path,
+                face_crop=face_crop
             )
             entry['label'] = label
             all_sample_entries.append(entry)
