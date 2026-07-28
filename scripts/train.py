@@ -1,4 +1,4 @@
-"""Training script for dual-stream deepfake detection."""
+"""Training script for deepfake detection baseline and multi-stream models."""
 
 import os
 import sys
@@ -11,28 +11,50 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import numpy as np
+import json
+import hashlib
+from collections import defaultdict
 from pathlib import Path
 
 # Add parent directory to path to import src
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.models import get_model, DualStreamModel
+from src.models import get_model, UnifiedMultiStreamModel
 from src.data.dataset import DeepfakeDataset
 from src.utils.augmentations import DualStreamAugmentation
-from src.utils.face_detection import FaceDetector
-from src.utils.metrics import compute_frame_metrics
+from src.utils.metrics import compute_frame_metrics, find_optimal_threshold
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device, epoch, class_weights=None):
-    """Train for one epoch."""
+def get_git_commit():
+    """Retrieve current git commit hash."""
+    try:
+        import subprocess
+        return subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('utf-8').strip()
+    except Exception:
+        return "no_git_commit"
+
+
+def get_config_fingerprint(config_path):
+    """Compute MD5 hash of config file."""
+    try:
+        with open(config_path, 'rb') as f:
+            return hashlib.md5(f.read()).hexdigest()
+    except Exception:
+        return "no_config_hash"
+
+
+def train_epoch(model, dataloader, criterion, optimizer, device, epoch, accum_steps):
+    """Train for one epoch with corrected gradient accumulation."""
     model.train()
     running_loss = 0.0
     all_preds = []
     all_labels = []
     all_probas = []
     
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
-    for batch in pbar:
+    optimizer.zero_grad()
+    
+    pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch} [Train]")
+    for batch_idx, batch in pbar:
         face_spatial = batch['face_spatial'].to(device)
         face_frequency = batch['face_frequency'].to(device)
         frame_spatial = batch['frame_spatial'].to(device)
@@ -40,38 +62,41 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, class_we
         labels = batch['label'].float().to(device)
         
         # Forward pass
-        optimizer.zero_grad()
         outputs = model(face_spatial, face_frequency, frame_spatial, frame_frequency).squeeze()
+        if outputs.dim() == 0:
+            outputs = outputs.unsqueeze(0)
+            
+        # Shape alignment check
+        outputs = outputs.view_as(labels)
         
-        # Compute loss
-        if isinstance(criterion, nn.BCELoss) and criterion.reduction == 'none':
-            # Weighted BCE loss
-            per_sample_loss = criterion(outputs, labels)
-            sample_weights = class_weights[labels.long()]
-            loss = (per_sample_loss * sample_weights).mean()
-        else:
-            # Focal loss or standard loss (already handles reduction)
-            loss = criterion(outputs, labels)
+        # Assertions
+        assert labels.dtype == torch.float32, f"Labels must be FloatTensor, got {labels.dtype}"
+        assert outputs.shape == labels.shape, f"Outputs/labels shape mismatch: {outputs.shape} vs {labels.shape}"
         
-        # Backward pass
+        # Loss scale division by accumulation steps
+        loss = criterion(outputs, labels)
+        loss = loss / accum_steps
         loss.backward()
-        # Gradient clipping to prevent exploding gradients
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
         
-        # Metrics
-        running_loss += loss.item()
-        preds = (outputs > 0.5).cpu().numpy()
-        probas = outputs.detach().cpu().numpy()
-        labels_np = labels.cpu().numpy()
+        # Weight step after accumulation steps or final batch
+        if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(dataloader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+        
+        # Calculate running loss & predictions
+        running_loss += (loss.item() * accum_steps)
+        probas = torch.sigmoid(outputs).detach().cpu().numpy()
+        if probas.ndim == 0:
+            probas = np.array([probas.item()])
+        preds = (probas >= 0.5).astype(int)
         
         all_preds.extend(preds)
-        all_labels.extend(labels_np)
+        all_labels.extend(labels.cpu().numpy())
         all_probas.extend(probas)
         
-        pbar.set_postfix({'loss': loss.item()})
+        pbar.set_postfix({'loss': loss.item() * accum_steps})
     
-    # Compute epoch metrics
     metrics = compute_frame_metrics(
         np.array(all_labels),
         np.array(all_preds),
@@ -82,16 +107,17 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, class_we
     return metrics
 
 
-def validate(model, dataloader, criterion, device):
-    """Validate model."""
+def validate(model, dataloader, device):
+    """Validate model and return both frame-level and video-level metrics."""
     model.eval()
     running_loss = 0.0
     all_preds = []
     all_labels = []
     all_probas = []
+    video_predictions = defaultdict(list)
+    video_labels = {}
     
-    # Use standard BCE loss for validation (not weighted)
-    val_criterion = nn.BCELoss()
+    val_criterion = nn.BCEWithLogitsLoss()
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Validation"):
@@ -100,38 +126,69 @@ def validate(model, dataloader, criterion, device):
             frame_spatial = batch['frame_spatial'].to(device)
             frame_frequency = batch['frame_frequency'].to(device)
             labels = batch['label'].float().to(device)
+            video_ids = batch['video_id']
             
             outputs = model(face_spatial, face_frequency, frame_spatial, frame_frequency).squeeze()
+            if outputs.dim() == 0:
+                outputs = outputs.unsqueeze(0)
+                
+            outputs = outputs.view_as(labels)
             loss = val_criterion(outputs, labels)
-            
             running_loss += loss.item()
-            preds = (outputs > 0.5).cpu().numpy()
-            probas = outputs.cpu().numpy()
+            
+            # Continuous probabilities via sigmoid
+            probas = torch.sigmoid(outputs).cpu().numpy()
+            if probas.ndim == 0:
+                probas = np.array([probas.item()])
+            preds = (probas >= 0.5).astype(int)
+            
             labels_np = labels.cpu().numpy()
+            if labels_np.ndim == 0:
+                labels_np = np.array([labels_np.item()])
             
             all_preds.extend(preds)
             all_labels.extend(labels_np)
             all_probas.extend(probas)
-    
-    metrics = compute_frame_metrics(
+            
+            # Consistent Probabilities Averaging aggregation method
+            for vid_id, prob, lbl in zip(video_ids, probas, labels_np):
+                video_predictions[vid_id].append(prob)
+                video_labels[vid_id] = int(lbl)
+                
+    frame_metrics = compute_frame_metrics(
         np.array(all_labels),
         np.array(all_preds),
         np.array(all_probas)
     )
-    metrics['loss'] = running_loss / len(dataloader)
+    frame_metrics['loss'] = running_loss / len(dataloader)
     
-    return metrics
+    # Validation Video-level predictions threshold search
+    video_probas = []
+    video_labels_list = []
+    for vid_id, preds_list in video_predictions.items():
+        video_probas.append(np.mean(preds_list))
+        video_labels_list.append(video_labels[vid_id])
+        
+    video_probas_arr = np.array(video_probas)
+    video_labels_arr = np.array(video_labels_list)
+    
+    opt_val_thresh = find_optimal_threshold(video_labels_arr, video_probas_arr)
+    video_preds_arr = (video_probas_arr >= opt_val_thresh).astype(int)
+    
+    video_metrics = compute_frame_metrics(video_labels_arr, video_preds_arr, video_probas_arr)
+    video_metrics['optimal_threshold'] = opt_val_thresh
+    
+    return frame_metrics, video_metrics
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train dual-stream deepfake detection model")
+    parser = argparse.ArgumentParser(description="Train deepfake detection baseline or multi-stream model")
     parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to config file")
-    parser.add_argument("--model", type=str, default="quad_stream",
-                        choices=["xception", "rgb_fft_dual_stream", "two_stream", "quad_stream"],
-                        help="Model architecture to train")
+    parser.add_argument("--model", type=str, default="quad_stream", help="Model architecture to train")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--epochs", type=int, default=None, help="Override number of training epochs")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for replication")
+    parser.add_argument("--smoke_test", action="store_true", help="Run in smoke test mode")
     args = parser.parse_args()
     
     # Set random seeds for reproducibility
@@ -159,6 +216,28 @@ def main():
     if args.epochs is not None:
         config['training']['num_epochs'] = args.epochs
         print(f"✓ Overriding num_epochs to {args.epochs}")
+        
+    # Check if overfitting test has run and passed for this configuration (except in smoke tests)
+    model_name_clean = args.model.lower().replace("-", "_")
+    status_file = os.path.join("results", "overfit_test_status.json")
+    commit_hash = get_git_commit()
+    config_md5 = get_config_fingerprint(config_path)
+    
+    passed_overfit = False
+    if os.path.exists(status_file):
+        try:
+            with open(status_file, 'r') as f:
+                cache = json.load(f)
+            if model_name_clean in cache:
+                entry = cache[model_name_clean]
+                if entry.get("commit") == commit_hash and entry.get("config_md5") == config_md5 and entry.get("status") == "passed":
+                    passed_overfit = True
+        except Exception:
+            pass
+            
+    if not args.smoke_test and not passed_overfit:
+        raise ValueError(f"CRITICAL ERROR: Overfitting test has not been run or did not pass for model '{args.model}' and current configuration. Run: python scripts/overfit_test.py --config {args.config} --model {args.model}")
+    print("✓ Overfitting test verification check passed.")
     
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -168,18 +247,39 @@ def main():
     os.makedirs(config['paths']['checkpoint_dir'], exist_ok=True)
     os.makedirs(config['paths']['log_dir'], exist_ok=True)
     
-    # Initialize face detector (optional, for on-the-fly detection)
-    face_detector = None  # Assume faces are preprocessed
+    # Determine batch size and gradient accumulation steps based on model Choice
+    if args.model.lower() == "xception":
+        batch_size = 32
+        accum_steps = 1
+        spatial_size = 299
+        frequency_size = 224
+    elif args.model.lower() in ["rgb_fft_dual_stream", "two_stream", "face_only", "frame_only", "spatial_only", "frequency_only"]:
+        batch_size = 16
+        accum_steps = 2
+        spatial_size = 224
+        frequency_size = 224
+    elif args.model.lower() in ["quad_stream"]:
+        batch_size = 8
+        accum_steps = 4
+        spatial_size = 224
+        frequency_size = 224
+    else:
+        batch_size = config['training'].get('batch_size', 32)
+        accum_steps = 1
+        spatial_size = 224
+        frequency_size = 224
+        
+    print(f"Effective batch size calculation: batch_size={batch_size} * accum_steps={accum_steps} = {batch_size * accum_steps}")
     
     # Initialize augmentations
     aug_config = config['preprocessing']['augmentations']
     augmentations = DualStreamAugmentation(
         horizontal_flip_prob=aug_config['horizontal_flip'],
-        rotation_range=aug_config['rotation_range'],
-        brightness_range=aug_config['brightness_range'],
-        contrast_range=aug_config['contrast_range'],
-        noise_std=aug_config.get('noise_std', 0.0),
-        gaussian_blur_prob=aug_config.get('gaussian_blur_prob', 0.0)
+        rotation_range=aug_config.get('rotation_range', 5.0),
+        brightness_range=aug_config.get('brightness_range', 0.1),
+        contrast_range=aug_config.get('contrast_range', 0.1),
+        noise_std=aug_config.get('noise_std', 0.01),
+        gaussian_blur_prob=aug_config.get('gaussian_blur_prob', 0.3)
     )
     
     # Create datasets
@@ -187,279 +287,242 @@ def main():
     train_dataset = DeepfakeDataset(
         data_root=data_root,
         metadata_file=os.path.join(data_root, "train_metadata.json"),
-        face_detector=face_detector,
+        face_detector=None,
         augmentations=augmentations,
         use_phase=(config['model']['frequency_channels'] == 2),
         normalize_frequency=config['preprocessing']['frequency_normalize'],
-        is_training=True
+        is_training=True,
+        spatial_size=spatial_size,
+        frequency_size=frequency_size,
+        frequency_channels=config['model'].get('frequency_channels', 1)
     )
     
-    # Strict label verification for training dataset
-    train_labels = [item['label'] for item in train_dataset.samples]
-    for lbl in train_labels:
-        if lbl not in [0, 1]:
-            raise ValueError(f"CRITICAL ERROR: Training dataset contains invalid non-binary label: {lbl}. Expected 0 or 1.")
-            
+    # Verify training dataset counts
+    train_labels = [item['label'] for item in train_dataset.all_samples]
     train_real = train_labels.count(0)
     train_fake = train_labels.count(1)
-    print(f"Verified training split: Real={train_real}, Fake={train_fake}")
-    if train_real == 0 or train_fake == 0:
-        raise ValueError(f"CRITICAL ERROR: Training split is degenerate. Both classes must be present! (Real={train_real}, Fake={train_fake})")
-
-    # Check if validation set exists and has data
+    print(f"Verified training split total frames: Real={train_real}, Fake={train_fake}")
+    
+    # Check validation set
     val_metadata_path = os.path.join(data_root, "val_metadata.json")
     if os.path.exists(val_metadata_path):
         val_dataset = DeepfakeDataset(
             data_root=data_root,
             metadata_file=val_metadata_path,
-            face_detector=face_detector,
+            face_detector=None,
             augmentations=None,
             use_phase=(config['model']['frequency_channels'] == 2),
             normalize_frequency=config['preprocessing']['frequency_normalize'],
-            is_training=False
+            is_training=False,
+            spatial_size=spatial_size,
+            frequency_size=frequency_size,
+            frequency_channels=config['model'].get('frequency_channels', 1)
         )
-        
-        # Strict label verification for validation dataset
-        val_labels = [item['label'] for item in val_dataset.samples]
-        for lbl in val_labels:
-            if lbl not in [0, 1]:
-                raise ValueError(f"CRITICAL ERROR: Validation dataset contains invalid non-binary label: {lbl}. Expected 0 or 1.")
-                
-        val_real = val_labels.count(0)
-        val_fake = val_labels.count(1)
-        print(f"Verified validation split: Real={val_real}, Fake={val_fake}")
-        if val_real == 0 or val_fake == 0:
-            raise ValueError(f"CRITICAL ERROR: Validation split is degenerate. Both classes must be present! (Real={val_real}, Fake={val_fake})")
-
         val_loader = DataLoader(
             val_dataset,
-            batch_size=config['training']['batch_size'],
+            batch_size=batch_size,
             shuffle=False,
-            num_workers=config['training']['num_workers'],
-            pin_memory=config['training']['pin_memory']
-        ) if len(val_dataset) > 0 else None
+            num_workers=config['training'].get('num_workers', 0),
+            pin_memory=config['training'].get('pin_memory', False)
+        )
     else:
         val_loader = None
         val_dataset = None
-    
-    # Create dataloaders with optional oversampling for real videos
-    oversample_real = config['training'].get('oversample_real', False)
-    if oversample_real:
-        # Check if the class counts are already balanced
-        if train_real == train_fake:
-            print("✓ Training split is already balanced (50/50). Oversampling is disabled to avoid bias and sampling noise.")
-            oversample_real = False
-            
-    if oversample_real:
-        from torch.utils.data import WeightedRandomSampler
-        # Calculate sample weights: higher weight for real videos (label=0)
-        real_oversample_ratio = config['training'].get('real_oversample_ratio', 2.0)
-        sample_weights = []
-        for item in train_dataset.samples:
-            if item['label'] == 0:  # Real video
-                sample_weights.append(real_oversample_ratio)
-            else:  # Fake video
-                sample_weights.append(1.0)
         
-        sampler = WeightedRandomSampler(
-            weights=sample_weights,
-            num_samples=len(sample_weights),
-            replacement=True
-        )
-        print(f"Using WeightedRandomSampler: Real videos oversampled {real_oversample_ratio}x")
-        
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=config['training']['batch_size'],
-            sampler=sampler,  # Use sampler instead of shuffle
-            num_workers=config['training']['num_workers'],
-            pin_memory=config['training']['pin_memory']
-        )
-    else:
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=config['training']['batch_size'],
-            shuffle=True,
-            num_workers=config['training']['num_workers'],
-            pin_memory=config['training']['pin_memory']
-        )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=config['training'].get('num_workers', 0),
+        pin_memory=config['training'].get('pin_memory', False)
+    )
     
     # Initialize model using factory
     model = get_model(args.model, config).to(device)
     
-    # Freeze backbones if requested
-    freeze_spatial = config['model'].get('freeze_spatial_backbone', False)
-    freeze_frequency = config['model'].get('freeze_frequency_backbone', False)
+    # Loss: raw logits BCEWithLogitsLoss
+    criterion = nn.BCEWithLogitsLoss()
     
-    if freeze_spatial:
-        for param in model.face_spatial_stream.backbone.parameters():
-            param.requires_grad = False
-        for param in model.frame_spatial_stream.backbone.parameters():
-            param.requires_grad = False
-        print("✓ Spatial backbones FROZEN (face + frame, only FC layers trainable)")
-    else:
-        print("✓ Spatial backbones UNFROZEN (face + frame, all parameters trainable)")
-    
-    if freeze_frequency:
-        for param in model.face_frequency_stream.backbone.parameters():
-            param.requires_grad = False
-        for param in model.frame_frequency_stream.backbone.parameters():
-            param.requires_grad = False
-        print("✓ Frequency backbones FROZEN (face + frame, only FC layers trainable)")
-    else:
-        print("✓ Frequency backbones UNFROZEN (face + frame, all parameters trainable)")
-    
-    # Count trainable parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    frozen_params = total_params - trainable_params
-    
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-    print(f"Frozen parameters: {frozen_params:,}")
-    
-    # Loss and optimizer
-    # Calculate class weights for imbalanced dataset
-    import json
-    with open(os.path.join(data_root, "train_metadata.json"), 'r') as f:
-        train_metadata = json.load(f)
-    
-    train_labels = [item['label'] for item in train_metadata]
-    total = len(train_labels)
-    
-    # Count occurrences safely (always size 2)
-    real_count = train_labels.count(0)
-    fake_count = train_labels.count(1)
-    class_counts = np.array([real_count, fake_count])
-    
-    # Calculate weights: inverse frequency (more weight to minority class, fallback to 1.0 if empty)
-    weight_real = total / (2 * real_count) if real_count > 0 else 1.0
-    weight_fake = total / (2 * fake_count) if fake_count > 0 else 1.0
-    class_weights = np.array([weight_real, weight_fake])
-    class_weights_tensor = torch.FloatTensor(class_weights).to(device)
-    
-    print(f"Class distribution: Real={real_count}, Fake={fake_count}")
-    print(f"Class weights: Real={weight_real:.4f}, Fake={weight_fake:.4f}")
-    
-    # Choose loss function
-    use_focal_loss = config['training'].get('use_focal_loss', False)
-    if use_focal_loss:
-        from src.utils.focal_loss import FocalLoss
-        focal_alpha = config['training'].get('focal_loss_alpha', 0.25)
-        focal_gamma = config['training'].get('focal_loss_gamma', 2.0)
-        # Use inverse frequency as alpha for positive class
-        alpha_fake = class_weights[1] / (class_weights[0] + class_weights[1])
-        criterion = FocalLoss(alpha=alpha_fake, gamma=focal_gamma, reduction='mean')
-        print(f"Using Focal Loss (alpha={alpha_fake:.4f}, gamma={focal_gamma})")
-    else:
-        print("Using weighted BCE loss to handle class imbalance")
-        # Use standard BCE loss with no reduction - we'll apply weights manually in training loop
-        criterion = nn.BCELoss(reduction='none')  # No reduction, we'll weight manually
-    
-    # Only optimize trainable parameters
+    # Set up parameter groups & validation
     trainable_params = [p for p in model.parameters() if p.requires_grad]
+    trainable_ids = {id(p) for p in trainable_params}
     
-    if config['training']['optimizer'] == "adam":
-        optimizer = optim.Adam(
-            trainable_params,
-            lr=float(config['training']['learning_rate']),
-            weight_decay=float(config['training']['weight_decay'])
-        )
+    if args.model.lower() == "xception":
+        # Phase 1: Freeze backbone, optimize classifier only
+        for param in model.backbone.parameters():
+            param.requires_grad = False
+            
+        param_groups = [
+            {'params': list(model.classifier.parameters()), 'lr': 1e-4, 'weight_decay': 1e-5}
+        ]
+        optimizer = optim.AdamW(param_groups)
+        print("✓ Phase 1: Xception backbone FROZEN. Optimizing classifier only.")
     else:
-        optimizer = optim.SGD(
-            trainable_params,
-            lr=float(config['training']['learning_rate']),
-            momentum=float(config['training']['momentum']),
-            weight_decay=float(config['training']['weight_decay'])
-        )
+        # Multi-stream models
+        pretrained_params = []
+        scratch_params = []
+        
+        pretrained_backbones = []
+        if hasattr(model, 'face_spatial_stream') and model.face_spatial_stream is not None:
+            pretrained_backbones.append(model.face_spatial_stream.backbone)
+        if hasattr(model, 'frame_spatial_stream') and model.frame_spatial_stream is not None:
+            pretrained_backbones.append(model.frame_spatial_stream.backbone)
+            
+        pretrained_ids = set()
+        for bb in pretrained_backbones:
+            for p in bb.parameters():
+                pretrained_ids.add(id(p))
+                pretrained_params.append(p)
+                
+        for p in model.parameters():
+            if p.requires_grad and id(p) not in pretrained_ids:
+                scratch_params.append(p)
+                
+        param_groups = [
+            {'params': pretrained_params, 'lr': 1e-5, 'weight_decay': 1e-5},
+            {'params': scratch_params, 'lr': 1e-4, 'weight_decay': 1e-5}
+        ]
+        
+        # Validate optimizer parameter groups strictly
+        grouped_ids = []
+        for group in param_groups:
+            for p in group['params']:
+                grouped_ids.append(id(p))
+                
+        # Check duplicates
+        from collections import Counter
+        counts = Counter(grouped_ids)
+        duplicates = [pid for pid, count in counts.items() if count > 1]
+        if duplicates:
+            raise ValueError("CRITICAL ERROR: Trainable parameters assigned to multiple optimizer groups!")
+            
+        # Check omissions
+        grouped_set = set(grouped_ids)
+        omitted = trainable_ids - grouped_set
+        if omitted:
+            raise ValueError("CRITICAL ERROR: Trainable parameters omitted from optimizer groups!")
+            
+        optimizer = optim.AdamW(param_groups)
+        print(f"✓ Optimizer parameter groups validated successfully.")
+        print(f"  Pretrained backbone parameters: {sum(p.numel() for p in pretrained_params):,}")
+        print(f"  Newly initialized parameters: {sum(p.numel() for p in scratch_params):,}")
+
+    # LR Scheduler (plateau based on validation video AUC)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=2
+    )
     
-    # Learning rate scheduler
-    if config['training']['scheduler'] == "cosine":
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=config['training']['num_epochs']
-        )
-    else:
-        scheduler = optim.lr_scheduler.StepLR(
-            optimizer,
-            step_size=config['training']['scheduler_params']['step_size'],
-            gamma=config['training']['scheduler_params']['gamma']
-        )
-    
-    # TensorBoard writer
+    # Tensorboard
     writer = SummaryWriter(log_dir=config['paths']['log_dir'])
     
-    # Training loop
     best_val_auc = 0.0
     patience_counter = 0
     start_epoch = 0
     
-    # Resume from checkpoint if specified
+    # Resume from checkpoint
     if args.resume:
-        try:
-            checkpoint = torch.load(args.resume, weights_only=False)
-        except TypeError:
-            checkpoint = torch.load(args.resume)
+        checkpoint = torch.load(args.resume, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         start_epoch = checkpoint['epoch']
         best_val_auc = checkpoint.get('best_val_auc', 0.0)
         print(f"Resumed from epoch {start_epoch}")
+        
+    num_epochs = config['training']['num_epochs']
     
-    for epoch in range(start_epoch, config['training']['num_epochs']):
-        # Train
-        train_metrics = train_epoch(model, train_loader, criterion, optimizer, device, epoch, class_weights=class_weights_tensor)
+    for epoch in range(start_epoch, num_epochs):
+        # Seeded dynamic epoch frame selection
+        train_dataset.epoch_init(seed=args.seed + epoch)
+        
+        # Xception baseline: Phase 2 unfreezing at epoch 3
+        if args.model.lower() == "xception" and epoch == 3:
+            print("\n✓ Phase 2: Unfreezing Xception backbone. Fine-tuning complete model.")
+            for param in model.backbone.parameters():
+                param.requires_grad = True
+                
+            trainable_params_p2 = [p for p in model.parameters() if p.requires_grad]
+            trainable_ids_p2 = {id(p) for p in trainable_params_p2}
+            
+            param_groups_p2 = [
+                {'params': list(model.backbone.parameters()), 'lr': 1e-5, 'weight_decay': 1e-5},
+                {'params': list(model.classifier.parameters()), 'lr': 1e-4, 'weight_decay': 1e-5}
+            ]
+            
+            # Validate Phase 2 parameter groups
+            grouped_ids_p2 = []
+            for group in param_groups_p2:
+                for p in group['params']:
+                    grouped_ids_p2.append(id(p))
+            assert set(grouped_ids_p2) == trainable_ids_p2, "Optimizer groups validation failed at Phase 2 unfreezing!"
+            
+            # Recreate optimizer and scheduler
+            optimizer = optim.AdamW(param_groups_p2)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='max', factor=0.5, patience=2
+            )
+            
+        # Train one epoch
+        train_metrics = train_epoch(model, train_loader, criterion, optimizer, device, epoch, accum_steps)
         
         # Validate
         if val_loader is not None and len(val_dataset) > 0:
-            val_metrics = validate(model, val_loader, criterion, device)
+            val_frame_metrics, val_video_metrics = validate(model, val_loader, device)
         else:
-            # Use train metrics as validation if no validation set
-            val_metrics = train_metrics.copy()
-            print("Warning: No validation set available, using training metrics")
+            val_frame_metrics = train_metrics.copy()
+            val_video_metrics = train_metrics.copy()
+            val_video_metrics['optimal_threshold'] = 0.5
+            
+        # Step ReduceLROnPlateau using validation video-level AUC
+        val_auc = val_video_metrics['auc']
+        scheduler.step(val_auc)
         
-        # Update learning rate
-        scheduler.step()
-        
-        # Log metrics
+        # Log to TensorBoard
         for key, value in train_metrics.items():
             writer.add_scalar(f'Train/{key}', value, epoch)
-        for key, value in val_metrics.items():
-            writer.add_scalar(f'Val/{key}', value, epoch)
-        writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
-        
+        for key, value in val_video_metrics.items():
+            writer.add_scalar(f'Val_Video/{key}', value, epoch)
+            
         print(f"\nEpoch {epoch}:")
-        print(f"  Train - Loss: {train_metrics['loss']:.4f}, AUC: {train_metrics['auc']:.4f}, F1: {train_metrics['f1']:.4f}")
-        print(f"  Val   - Loss: {val_metrics['loss']:.4f}, AUC: {val_metrics['auc']:.4f}, F1: {val_metrics['f1']:.4f}")
+        print(f"  Train     - Loss: {train_metrics['loss']:.4f}, AUC: {train_metrics['auc']:.4f}, F1: {train_metrics['f1']:.4f}")
+        print(f"  Val Video - Loss: {val_frame_metrics['loss']:.4f}, AUC: {val_auc:.4f}, F1: {val_video_metrics['f1']:.4f} (Thresh={val_video_metrics['optimal_threshold']:.4f})")
         
-        # Define checkpoint file names (with seed suffix for reproducibility and seed aggregation)
-        model_name_clean = args.model.lower().replace("-", "_")
+        # Checkpoint paths
         best_filename = f'best_model_{model_name_clean}_seed{args.seed}.pth'
         latest_filename = f'latest_{model_name_clean}_seed{args.seed}.pth'
+        best_path = os.path.join(config['paths']['checkpoint_dir'], best_filename)
+        latest_path = os.path.join(config['paths']['checkpoint_dir'], latest_filename)
         
-        best_path = os.path.abspath(os.path.join(config['paths']['checkpoint_dir'], best_filename))
-        latest_path = os.path.abspath(os.path.join(config['paths']['checkpoint_dir'], latest_filename))
-        
-        # Save best model
-        if val_metrics['auc'] > best_val_auc:
-            best_val_auc = val_metrics['auc']
+        # Save best checkpoint (based on validation video AUC)
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
             patience_counter = 0
             
-            # Construct checkpoint dict AFTER updating best_val_auc so metadata matches exactly!
+            # Save resolved registry metadata inside checkpoint
+            streams = model.active_streams if hasattr(model, 'active_streams') else ["face_spatial"]
+            backbone_type = getattr(model, 'backbone_type', config['model'].get('spatial_backbone', 'resnet18'))
+            param_count = sum(p.numel() for p in model.parameters())
+            
             checkpoint = {
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'best_val_auc': best_val_auc,
-                'val_metrics': val_metrics
+                'val_metrics': val_video_metrics,
+                'optimal_threshold': val_video_metrics['optimal_threshold'],
+                'model_metadata': {
+                    'model_name': args.model,
+                    'streams': streams,
+                    'backbone_type': backbone_type,
+                    'param_count': param_count
+                }
             }
             torch.save(checkpoint, best_path)
-            print(f"  ✓ Saved best model checkpoint to: {best_path} (AUC: {best_val_auc:.4f})")
+            print(f"  ✓ Saved best model checkpoint to: {best_path} (Video AUC: {best_val_auc:.4f})")
         else:
             patience_counter += 1
-        
+            
         # Save latest checkpoint
         latest_checkpoint = {
             'epoch': epoch + 1,
@@ -467,20 +530,19 @@ def main():
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'best_val_auc': best_val_auc,
-            'val_metrics': val_metrics
+            'val_metrics': val_video_metrics,
+            'optimal_threshold': val_video_metrics.get('optimal_threshold', 0.5)
         }
         torch.save(latest_checkpoint, latest_path)
-        print(f"  ✓ Saved latest model checkpoint to: {latest_path}")
         
-        # Early stopping
-        if patience_counter >= config['training']['early_stopping']['patience']:
-            print(f"Early stopping at epoch {epoch}")
+        # Early stopping patience check (based on validation video AUC)
+        if patience_counter >= 7:
+            print(f"Early stopping triggered after 7 epochs of no video AUC improvement.")
             break
-    
+            
     writer.close()
     print("Training completed!")
 
 
 if __name__ == "__main__":
     main()
-

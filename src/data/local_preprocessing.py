@@ -14,33 +14,37 @@ from src.utils.frequency_domain import prepare_frequency_input
 
 
 def extract_frames_from_video(video_path: str, target_fps: int = 3, max_frames: int = 50) -> List[Tuple[int, np.ndarray]]:
-    """Extract frames from video file at target FPS."""
+    """Extract exactly 32 candidate frames sampled uniformly from the entire video."""
+    num_frames = 32
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return []
 
-    original_fps = cap.get(cv2.CAP_PROP_FPS)
-    if original_fps <= 0:
-        original_fps = 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        cap.release()
+        return []
 
-    frame_interval = max(1, int(round(original_fps / target_fps)))
+    if total_frames <= num_frames:
+        indices = list(range(total_frames))
+    else:
+        indices = np.linspace(0, total_frames - 1, num_frames, dtype=int).tolist()
+
     frames = []
-    frame_count = 0
+    current_idx = 0
+    indices_set = set(indices)
 
-    while cap.isOpened():
+    while cap.isOpened() and len(frames) < len(indices_set):
         ret, frame = cap.read()
         if not ret:
             break
-
-        if frame_count % frame_interval == 0:
+        if current_idx in indices_set:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append((frame_count, frame_rgb))
-            if len(frames) >= max_frames:
-                break
-
-        frame_count += 1
+            frames.append((current_idx, frame_rgb))
+        current_idx += 1
 
     cap.release()
+    frames.sort(key=lambda x: x[0])
     return frames
 
 
@@ -233,53 +237,32 @@ def partition_by_connected_components(sample_entries: List[Dict[str, Any]], trai
 
 def assign_splits(sample_entries: List[Dict[str, Any]], data_root: str, train_ratio=0.7, val_ratio=0.15):
     """
-    Assign each sample entry to train, val, or test split using official splits if available,
-    otherwise falling back to connected component partitioning.
+    Assign each sample entry to train, val, or test split using official splits.
+    Ensures that a manipulated video A_B is assigned to a split only if BOTH source IDs A and B are in that split.
     """
     train_ids, val_ids, test_ids = load_official_ff_splits(data_root)
     
-    use_official = False
-    if train_ids and val_ids and test_ids:
-        # Dry-run partitioning using official splits to check for empty/degenerate splits
-        train_samples_test = []
-        val_samples_test = []
-        test_samples_test = []
-        for sample in sample_entries:
-            source_ids = extract_source_video_ids(sample.get('video_path', ''))
-            is_train = any(s_id in train_ids for s_id in source_ids)
-            is_val = any(s_id in val_ids for s_id in source_ids)
-            is_test = any(s_id in test_ids for s_id in source_ids)
-            if is_train:
-                train_samples_test.append(sample)
-            elif is_val:
-                val_samples_test.append(sample)
-            elif is_test:
-                test_samples_test.append(sample)
-            else:
-                train_samples_test.append(sample)
-                
-        # If all splits are populated with at least one sample, we are safe to use official splits!
-        if len(train_samples_test) > 0 and len(val_samples_test) > 0 and len(test_samples_test) > 0:
-            use_official = True
-            
-    if use_official:
-        print("✓ Using official FaceForensics++ splits.")
-    else:
-        if train_ids and val_ids and test_ids:
-            print("⚠️  Official splits resulted in empty splits (common with small subsets). Falling back to connected components partition...")
-        else:
-            print("⚠️  Official splits not available. Partitioning using connected components to prevent leakage...")
-        train_ids, val_ids, test_ids = partition_by_connected_components(sample_entries, train_ratio, val_ratio)
+    if not train_ids or not val_ids or not test_ids:
+        raise ValueError("CRITICAL ERROR: Official FaceForensics++ splits JSON files are missing or could not be loaded!")
         
     train_samples = []
     val_samples = []
     test_samples = []
     
+    unmatched_samples = []
+    
     for sample in sample_entries:
         source_ids = extract_source_video_ids(sample.get('video_path', ''))
-        is_train = any(s_id in train_ids for s_id in source_ids)
-        is_val = any(s_id in val_ids for s_id in source_ids)
-        is_test = any(s_id in test_ids for s_id in source_ids)
+        if not source_ids:
+            unmatched_samples.append(sample)
+            continue
+            
+        # All source IDs must belong to the train split to be train
+        is_train = all(s_id in train_ids for s_id in source_ids)
+        # All source IDs must belong to the val split to be val
+        is_val = all(s_id in val_ids for s_id in source_ids)
+        # All source IDs must belong to the test split to be test
+        is_test = all(s_id in test_ids for s_id in source_ids)
         
         if is_train:
             train_samples.append(sample)
@@ -288,17 +271,43 @@ def assign_splits(sample_entries: List[Dict[str, Any]], data_root: str, train_ra
         elif is_test:
             test_samples.append(sample)
         else:
-            train_samples.append(sample)
+            unmatched_samples.append(sample)
             
-    # Secondary fallback to prevent empty or degenerate splits on extremely small debugging/test datasets
-    if (len(train_samples) == 0 or len(val_samples) == 0 or len(test_samples) == 0 or
-        sum(1 for s in train_samples if s['label'] == 0) == 0 or sum(1 for s in train_samples if s['label'] == 1) == 0 or
-        sum(1 for s in val_samples if s['label'] == 0) == 0 or sum(1 for s in val_samples if s['label'] == 1) == 0 or
-        sum(1 for s in test_samples if s['label'] == 0) == 0 or sum(1 for s in test_samples if s['label'] == 1) == 0):
-        print("⚠️  Splits are empty or degenerate. Forcing class-balanced round-robin allocation for E2E smoke test...")
+    print(f"\nSplit Assignment Report:")
+    print(f"  Train frame samples: {len(train_samples)}")
+    print(f"  Val frame samples: {len(val_samples)}")
+    print(f"  Test frame samples: {len(test_samples)}")
+    print(f"  Unmatched/Excluded frame samples (cross-split or missing): {len(unmatched_samples)}")
+    
+    # Validate final counts of real and fake videos (not frames)
+    def count_unique_videos(samples):
+        reals = set()
+        fakes = set()
+        for s in samples:
+            vid = s['video_id']
+            lbl = s['label']
+            if lbl == 0:
+                reals.add(vid)
+            else:
+                fakes.add(vid)
+        return len(reals), len(fakes)
+        
+    train_reals, train_fakes = count_unique_videos(train_samples)
+    val_reals, val_fakes = count_unique_videos(val_samples)
+    test_reals, test_fakes = count_unique_videos(test_samples)
+    
+    print(f"Video-level split counts:")
+    print(f"  Train: Real={train_reals}, Fake={train_fakes} (Total={train_reals + train_fakes})")
+    print(f"  Val: Real={val_reals}, Fake={val_fakes} (Total={val_reals + val_fakes})")
+    print(f"  Test: Real={test_reals}, Fake={test_fakes} (Total={test_reals + test_fakes})")
+    
+    total_videos = train_reals + train_fakes + val_reals + val_fakes + test_reals + test_fakes
+    is_smoke_test = total_videos < 50
+    
+    if is_smoke_test and (len(train_samples) == 0 or len(val_samples) == 0 or len(test_samples) == 0):
+        print("⚠️  Smoke test splits are empty or degenerate. Forcing class-balanced round-robin allocation...")
         train_samples, val_samples, test_samples = [], [], []
         
-        # Group samples by video_id and label
         reals_by_video = {}
         fakes_by_video = {}
         for sample in sample_entries:
@@ -330,6 +339,24 @@ def assign_splits(sample_entries: List[Dict[str, Any]], data_root: str, train_ra
                 val_samples.extend(samples)
             else:
                 test_samples.extend(samples)
+                
+        train_reals, train_fakes = count_unique_videos(train_samples)
+        val_reals, val_fakes = count_unique_videos(val_samples)
+        test_reals, test_fakes = count_unique_videos(test_samples)
+        
+        print(f"Updated video-level split counts:")
+        print(f"  Train: Real={train_reals}, Fake={train_fakes} (Total={train_reals + train_fakes})")
+        print(f"  Val: Real={val_reals}, Fake={val_fakes} (Total={val_reals + val_fakes})")
+        print(f"  Test: Real={test_reals}, Fake={test_fakes} (Total={test_reals + test_fakes})")
+        
+    if not is_smoke_test:
+        # Enforce strict count checks
+        if train_reals < 700 or train_fakes < 700:
+            raise ValueError(f"CRITICAL ERROR: Incomplete training dataset! Expected approx 720 real and 720 fake training videos, got {train_reals} real and {train_fakes} fake.")
+        if val_reals < 130 or val_fakes < 130:
+            raise ValueError(f"CRITICAL ERROR: Incomplete validation dataset! Expected approx 140 real and 140 fake validation videos, got {val_reals} real and {val_fakes} fake.")
+        if test_reals < 130 or test_fakes < 130:
+            raise ValueError(f"CRITICAL ERROR: Incomplete test dataset! Expected approx 140 real and 140 fake test videos, got {test_reals} real and {test_fakes} fake.")
             
     return train_samples, val_samples, test_samples
 
@@ -509,42 +536,51 @@ def process_faceforensics_structure(
         if fake_files:
             manip_methods["default"] = sorted(list(set(fake_files)))
 
-    # Perform reproducible balanced selection using random seed 42
-    import random
-    random_state = random.Random(42)
-    
     real_files = sorted(list(set(real_files)))
-    random_state.shuffle(real_files)
     
-    selected_fakes = []
+    # We want to pair every real video with its corresponding fake video in Deepfakes
+    real_map = {}
+    for r_file in real_files:
+        r_id = os.path.splitext(os.path.basename(r_file))[0]
+        real_map[r_id] = r_file
+        
+    all_fake_files = []
     if manip_methods:
         for m in manip_methods:
-            random_state.shuffle(manip_methods[m])
+            all_fake_files.extend(manip_methods[m])
+    all_fake_files = sorted(list(set(all_fake_files)))
+    
+    fake_map = {}
+    for f_file in all_fake_files:
+        f_basename = os.path.splitext(os.path.basename(f_file))[0]
+        parts = f_basename.split('_')
+        if parts:
+            t_id = parts[0]
+            fake_map[t_id] = f_file
             
-        method_keys = sorted(list(manip_methods.keys()))
-        total_fake_needed = len(real_files)
-        if max_videos is not None and max_videos > 0:
-            total_fake_needed = max_videos // 2
+    paired_list = []
+    for r_id, r_file in sorted(real_map.items()):
+        if r_id in fake_map:
+            paired_list.append((r_file, 0))  # Real
+            paired_list.append((fake_map[r_id], 1))  # Fake (corresponding manipulated version)
             
-        while len(selected_fakes) < total_fake_needed:
-            added_any = False
-            for m in method_keys:
-                if len(selected_fakes) >= total_fake_needed:
-                    break
-                if len(manip_methods[m]) > 0:
-                    selected_fakes.append(manip_methods[m].pop(0))
-                    added_any = True
-            if not added_any:
-                break
-                
+    # Print status of pairing and warn about missing or duplicate files
+    print(f"Dataset Pairing Summary:")
+    print(f"  Total real files discovered: {len(real_files)}")
+    print(f"  Total fake files discovered: {len(all_fake_files)}")
+    print(f"  Successfully paired real-fake videos: {len(paired_list) // 2}")
+    
+    missing_fakes = [r_id for r_id in real_map if r_id not in fake_map]
+    if missing_fakes:
+        print(f"  ⚠️  Warning: {len(missing_fakes)} real videos are missing their corresponding fake videos in the raw directory.")
+        
     if max_videos is not None and max_videos > 0:
-        half_max = max_videos // 2
-        selected_reals = real_files[:half_max]
-        video_list = [(v, 0) for v in selected_reals] + [(v, 1) for v in selected_fakes]
+        # Keep it balanced: half real, half fake
+        num_pairs = max_videos // 2
+        video_list = paired_list[:(num_pairs * 2)]
     else:
-        video_list = [(v, 0) for v in real_files] + [(v, 1) for v in selected_fakes]
-
-    print(f"Found {len(real_files)} real videos. Selected fakes: {len(selected_fakes)} distributed across categories: {list(manip_methods.keys()) if manip_methods else []}")
+        video_list = paired_list
+        
     print(f"Final selected video list for preprocessing: {len(video_list)} total.")
 
     # Initialize FaceDetector

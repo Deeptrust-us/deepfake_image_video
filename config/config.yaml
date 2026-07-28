@@ -40,20 +40,20 @@ model:
   frequency_channels: 1  # 1 for magnitude only, 2 for magnitude+phase
   # Frequency stream now uses ResNet50 backbone (no frequency_layers needed)
   fusion_dim: 512
-  dropout: 0.6  # Increased dropout for better regularization
+  dropout: 0.5  # Default dropout (0.5 for quad-stream, 0.3 for dual-stream, dynamically handled)
   pretrained: true
-  freeze_spatial_backbone: false  # Set to true to freeze spatial backbone (only train FC layers)
-  freeze_frequency_backbone: false  # Set to true to freeze frequency backbone
+  freeze_spatial_backbone: false
+  freeze_frequency_backbone: false
 
 # Training Configuration
 training:
   batch_size: 32
-  num_epochs: 50
-  learning_rate: 5e-5  # Lower learning rate for ResNet50 frequency stream
-  optimizer: "adam"  # or "sgd"
-  momentum: 0.9  # for SGD
+  num_epochs: 30  # Xception trained for max 30, multi-stream trained for max 40 (overridden in code/CLI)
+  learning_rate: 1e-4  # Classification head / scratch streams learning rate
+  backbone_learning_rate: 1e-5  # Pretrained spatial backbones learning rate
+  optimizer: "adamw"
   weight_decay: 1e-5
-  use_focal_loss: true  # Use Focal Loss instead of weighted BCE
+  use_focal_loss: false  # BCEWithLogitsLoss is the default for balanced FF++ experiments
   focal_loss_alpha: 0.25  # Weighting factor for positive class
   focal_loss_gamma: 2.0  # Focusing parameter (higher = focus more on hard examples)
   oversample_real: true  # Oversample real videos to balance training batches

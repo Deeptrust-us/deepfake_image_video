@@ -59,8 +59,7 @@ class RGBFFTDualStreamModel(nn.Module):
         )
 
         self.classifier = nn.Sequential(
-            nn.Linear(fusion_dim // 2, 1),
-            nn.Sigmoid()
+            nn.Linear(fusion_dim // 2, 1)
         )
 
         self._initialize_weights()

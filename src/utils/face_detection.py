@@ -21,7 +21,7 @@ class FaceDetector:
         """
         self.device = device
         self.mtcnn = MTCNN(
-            image_size=256,
+            image_size=320,
             margin=0,
             min_face_size=min_face_size,
             thresholds=[0.6, 0.7, 0.7],
@@ -38,7 +38,7 @@ class FaceDetector:
             image: Input image as numpy array (BGR or RGB)
             
         Returns:
-            Aligned face image (224x224) or None if no face detected
+            Aligned face image (320x320) or None if no face detected
         """
         # Convert BGR to RGB if needed
         if len(image.shape) == 3 and image.shape[2] == 3:
@@ -69,8 +69,8 @@ class FaceDetector:
         # Ensure values are in [0, 1] range
         face_array = np.clip(face_array, 0, 1)
         
-        # Resize to 224x224
-        face_array = cv2.resize(face_array, (224, 224))
+        # Resize to 320x320
+        face_array = cv2.resize(face_array, (320, 320))
         
         return face_array
     

@@ -28,20 +28,12 @@ class DeepfakeDataset(Dataset):
         use_phase: bool = False,
         normalize_frequency: bool = True,
         is_training: bool = False,
-        target_size: Tuple[int, int] = (224, 224),
+        spatial_size: int = 224,
+        frequency_size: int = 224,
+        frequency_channels: int = 1
     ):
         """
         Initialize DeepfakeDataset.
-
-        Args:
-            data_root: Root directory of dataset
-            metadata_file: Path to metadata JSON file
-            face_detector: Face detector instance (optional, for on-the-fly detection)
-            augmentations: Augmentation instance (optional)
-            use_phase: Whether frequency input includes phase spectrum (2 channels vs 1 channel)
-            normalize_frequency: Whether to normalize frequency spectrums
-            is_training: Whether dataset is used for training
-            target_size: Target image size (H, W)
         """
         self.data_root = data_root
         self.metadata_file = metadata_file
@@ -50,7 +42,9 @@ class DeepfakeDataset(Dataset):
         self.use_phase = use_phase
         self.normalize_frequency = normalize_frequency
         self.is_training = is_training
-        self.target_size = target_size
+        self.spatial_size = spatial_size
+        self.frequency_size = frequency_size
+        self.frequency_channels = frequency_channels
 
         # Default image transforms (RGB standard ImageNet normalization)
         self.transform = transforms.Compose([
@@ -62,7 +56,11 @@ class DeepfakeDataset(Dataset):
         ])
 
         # Load samples from metadata
-        self.samples = self._load_metadata()
+        self.all_samples = self._load_metadata()
+        self.active_samples = []
+        
+        # Initial population of active samples
+        self.epoch_init(seed=42)
 
     def _load_metadata(self) -> List[Dict[str, Any]]:
         """Load sample entries from metadata JSON file."""
@@ -75,39 +73,76 @@ class DeepfakeDataset(Dataset):
 
         return metadata
 
-    def __len__(self) -> int:
-        return len(self.samples)
+    def epoch_init(self, seed: int):
+        """
+        Populate active_samples list:
+        - If is_training=True: Group by video_id and randomly select exactly 24 frames using a seeded generator.
+        - If is_training=False: Keep all 32 candidate frames.
+        """
+        if not self.all_samples:
+            self.active_samples = []
+            return
+            
+        if self.is_training:
+            # Group all samples by video_id
+            by_video = {}
+            for s in self.all_samples:
+                vid = s.get('video_id', 'unknown')
+                if vid not in by_video:
+                    by_video[vid] = []
+                by_video[vid].append(s)
+                
+            import random
+            rng = random.Random(seed)
+            
+            self.active_samples = []
+            for vid, v_samples in sorted(by_video.items()):
+                # Sort to ensure deterministic order before sampling
+                v_samples.sort(key=lambda x: x.get('frame_id', ''))
+                n = len(v_samples)
+                if n <= 24:
+                    self.active_samples.extend(v_samples)
+                else:
+                    selected = rng.sample(v_samples, 24)
+                    selected.sort(key=lambda x: x.get('frame_id', ''))
+                    self.active_samples.extend(selected)
+        else:
+            self.active_samples = list(self.all_samples)
 
-    def _load_image(self, rel_or_abs_path: str) -> np.ndarray:
-        """Load RGB image as float32 array in [0, 1]."""
+    def __len__(self) -> int:
+        return len(self.active_samples)
+
+    def _load_image(self, rel_or_abs_path: str, size: int) -> np.ndarray:
+        """Load RGB image as float32 array in [0, 1] resized to target size."""
         full_path = rel_or_abs_path if os.path.isabs(rel_or_abs_path) else os.path.join(self.data_root, rel_or_abs_path)
 
         if not os.path.exists(full_path):
-            # Return blank black image if missing
-            return np.zeros((self.target_size[0], self.target_size[1], 3), dtype=np.float32)
+            return np.zeros((size, size, 3), dtype=np.float32)
 
         image_bgr = cv2.imread(full_path)
         if image_bgr is None:
-            return np.zeros((self.target_size[0], self.target_size[1], 3), dtype=np.float32)
+            return np.zeros((size, size, 3), dtype=np.float32)
 
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        image_resized = cv2.resize(image_rgb, self.target_size)
+        image_resized = cv2.resize(image_rgb, (size, size))
         return image_resized.astype(np.float32) / 255.0
 
-    def _load_frequency(self, rel_or_abs_path: str, rgb_image: np.ndarray) -> np.ndarray:
+    def _load_frequency(self, rel_or_abs_path: str, rgb_image: np.ndarray, size: int) -> np.ndarray:
         """Load pre-computed frequency .npy file or compute frequency spectrum on the fly."""
         if rel_or_abs_path:
             full_path = rel_or_abs_path if os.path.isabs(rel_or_abs_path) else os.path.join(self.data_root, rel_or_abs_path)
             if os.path.exists(full_path):
                 try:
                     freq = np.load(full_path)
+                    if freq.shape[0] != size or freq.shape[1] != size:
+                        freq = cv2.resize(freq, (size, size))
                     if len(freq.shape) == 2:
                         freq = np.expand_dims(freq, axis=-1)
                     return freq.astype(np.float32)
                 except Exception:
                     pass
 
-        # Compute FFT from RGB image on the fly
+        # Compute FFT from RGB image on the fly (it is already resized to size x size)
         return prepare_frequency_input(
             rgb_image,
             use_phase=self.use_phase,
@@ -115,7 +150,7 @@ class DeepfakeDataset(Dataset):
         )
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        item = self.samples[idx]
+        item = self.active_samples[idx]
 
         # Load RGB face & frame
         face_path = item.get('face_path', '')
@@ -127,8 +162,8 @@ class DeepfakeDataset(Dataset):
         elif not frame_path and face_path:
             frame_path = face_path
 
-        face_rgb = self._load_image(face_path)
-        frame_rgb = self._load_image(frame_path)
+        face_rgb = self._load_image(face_path, self.spatial_size)
+        frame_rgb = self._load_image(frame_path, self.spatial_size)
 
         # Apply spatial data augmentations during training if specified
         is_augmented = False
@@ -141,8 +176,8 @@ class DeepfakeDataset(Dataset):
         face_freq_path = '' if is_augmented else item.get('face_frequency_path', '')
         frame_freq_path = '' if is_augmented else item.get('frame_frequency_path', item.get('frequency_path', ''))
 
-        face_freq = self._load_frequency(face_freq_path, face_rgb)
-        frame_freq = self._load_frequency(frame_freq_path, frame_rgb)
+        face_freq = self._load_frequency(face_freq_path, face_rgb, self.frequency_size)
+        frame_freq = self._load_frequency(frame_freq_path, frame_rgb, self.frequency_size)
 
         # Convert RGB images to Tensors & apply normalization and cast to float32
         face_spatial_tensor = self.transform(face_rgb).float()
@@ -151,6 +186,13 @@ class DeepfakeDataset(Dataset):
         # Convert Frequency arrays to Tensors (C, H, W)
         face_freq_tensor = torch.from_numpy(face_freq).permute(2, 0, 1).float()
         frame_freq_tensor = torch.from_numpy(frame_freq).permute(2, 0, 1).float()
+
+        # Replicate log-magnitude to 3 channels if requested
+        if self.frequency_channels == 3:
+            if face_freq_tensor.shape[0] == 1:
+                face_freq_tensor = face_freq_tensor.repeat(3, 1, 1)
+            if frame_freq_tensor.shape[0] == 1:
+                frame_freq_tensor = frame_freq_tensor.repeat(3, 1, 1)
 
         label = torch.tensor(item['label'], dtype=torch.long)
         video_id = item.get('video_id', 'unknown')

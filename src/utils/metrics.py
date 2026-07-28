@@ -81,16 +81,25 @@ def compute_eer(y_true: np.ndarray, y_proba: np.ndarray) -> float:
         
     try:
         fpr, tpr, thresholds = roc_curve(y_true, y_proba)
-        fnr = 1 - tpr
         
-        # Check if difference contains NaNs
-        diff = np.absolute(fnr - fpr)
-        if np.isnan(diff).all():
-            return 0.5
+        # Find diagonal crossing segment where fpr + tpr crosses 1.0
+        for i in range(len(fpr) - 1):
+            x1, y1 = fpr[i], tpr[i]
+            x2, y2 = fpr[i+1], tpr[i+1]
             
+            # Check if segment crosses the diagonal y = 1 - x, which is x + y = 1
+            if (x1 + y1 <= 1.0 <= x2 + y2) or (x2 + y2 <= 1.0 <= x1 + y1):
+                if x2 == x1:
+                    return float(x1)
+                m = (y2 - y1) / (x2 - x1)
+                x_intersect = (1.0 - y1 + m * x1) / (m + 1.0)
+                return float(x_intersect)
+                
+        # Fallback if no crossing segment is found
+        fnr = 1.0 - tpr
+        diff = np.abs(fnr - fpr)
         idx = np.nanargmin(diff)
-        eer = fpr[idx]
-        return float(eer)
+        return float((fpr[idx] + fnr[idx]) / 2.0)
     except Exception:
         return 0.5
 

@@ -41,8 +41,7 @@ class XceptionModel(nn.Module):
             nn.Linear(backbone_out_dim, feature_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(feature_dim, 1),
-            nn.Sigmoid()
+            nn.Linear(feature_dim, 1)
         )
 
         self._initialize_head()

@@ -1,43 +1,35 @@
-"""Dual-stream deepfake detection model architecture."""
+"""Modular Multi-Stream deepfake detection model architecture."""
 
 import torch
 import torch.nn as nn
 import torchvision.models as models
-from typing import Optional
+from typing import Optional, List
 
 
 class FrequencyStream(nn.Module):
     """Frequency domain stream using ResNet50 backbone."""
     
     def __init__(self, input_channels: int = 1, feature_dim: int = 256, 
-                 pretrained: bool = True):
+                 pretrained: bool = False):
         """
         Initialize frequency stream with ResNet50 backbone.
         
         Args:
-            input_channels: Number of input channels (1 for magnitude, 2 for magnitude+phase)
+            input_channels: Number of input channels (1 for magnitude, 3 for replicated magnitude)
             feature_dim: Output feature dimension
-            pretrained: Whether to use pretrained weights (may not be optimal for frequency domain)
+            pretrained: Whether to use pretrained weights
         """
         super(FrequencyStream, self).__init__()
         
-        # Load ResNet50 backbone
-        # For frequency domain, pretrained ImageNet weights may not be optimal
-        # Use pretrained=False for frequency stream, or use pretrained=True but reinitialize first layer
+        # Load ResNet50 backbone (frequency stream is typically trained from scratch)
         backbone = models.resnet50(pretrained=pretrained)
         
-        # Replace first conv layer to accept input_channels instead of 3
-        # Original: Conv2d(3, 64, kernel_size=7, stride=2, padding=3)
-        backbone.conv1 = nn.Conv2d(
-            input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
-        )
-        
-        # Initialize first conv layer with proper initialization for frequency domain
-        # Use Kaiming initialization (He initialization) which works well for ReLU activations
-        nn.init.kaiming_normal_(backbone.conv1.weight, mode='fan_out', nonlinearity='relu')
-        
-        # If using pretrained weights, we could try to adapt them, but for frequency domain
-        # it's better to start fresh or use a lower learning rate for pretrained layers
+        # Replace first conv layer to accept input_channels instead of 3 if input_channels != 3
+        if input_channels != 3:
+            backbone.conv1 = nn.Conv2d(
+                input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
+            )
+            nn.init.kaiming_normal_(backbone.conv1.weight, mode='fan_out', nonlinearity='relu')
         
         # Remove final fully connected layer
         self.backbone = nn.Sequential(*list(backbone.children())[:-1])
@@ -54,12 +46,6 @@ class FrequencyStream(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through frequency stream.
-        
-        Args:
-            x: Input frequency spectrum (B, C, H, W)
-            
-        Returns:
-            Feature vector (B, feature_dim)
         """
         x = self.backbone(x)
         x = x.view(x.size(0), -1)
@@ -84,7 +70,6 @@ class SpatialStream(nn.Module):
         
         if backbone_name == "resnet18":
             backbone = models.resnet18(pretrained=pretrained)
-            # Remove final fully connected layer
             self.backbone = nn.Sequential(*list(backbone.children())[:-1])
             backbone_dim = 512
         elif backbone_name == "efficientnet_b0":
@@ -96,16 +81,13 @@ class SpatialStream(nn.Module):
             raise ValueError(f"Unsupported backbone: {backbone_name}")
         
         self.fc = nn.Linear(backbone_dim, feature_dim)
+        nn.init.kaiming_normal_(self.fc.weight, mode='fan_out', nonlinearity='relu')
+        if self.fc.bias is not None:
+            nn.init.constant_(self.fc.bias, 0)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through spatial stream.
-        
-        Args:
-            x: Input image (B, 3, H, W)
-            
-        Returns:
-            Feature vector (B, feature_dim)
         """
         x = self.backbone(x)
         x = x.view(x.size(0), -1)
@@ -113,155 +95,141 @@ class SpatialStream(nn.Module):
         return x
 
 
-class DualStreamModel(nn.Module):
-    """Quad-stream deepfake detection model (face + frame, each with RGB + frequency)."""
+class UnifiedMultiStreamModel(nn.Module):
+    """
+    Unified multi-stream model supporting arbitrary subsets of streams:
+    - face_spatial (RGB face)
+    - face_frequency (FFT face)
+    - frame_spatial (RGB full frame)
+    - frame_frequency (FFT full-frame)
+    """
     
-    def __init__(self, spatial_backbone: str = "resnet18", 
-                 spatial_feature_dim: int = 256,
-                 frequency_channels: int = 1,
-                 fusion_dim: int = 512,
-                 dropout: float = 0.5,
-                 pretrained: bool = True,
-                 use_attention: bool = False):
+    def __init__(self, model_name: str, config: dict):
         """
-        Initialize quad-stream model.
+        Initialize multi-stream model.
+        """
+        super(UnifiedMultiStreamModel, self).__init__()
+        from src.models.registry import MODEL_REGISTRY
         
-        Args:
-            spatial_backbone: Backbone for spatial stream
-            spatial_feature_dim: Feature dimension for spatial stream
-            frequency_channels: Input channels for frequency stream (1 for magnitude, 2 for magnitude+phase)
-            fusion_dim: Dimension after fusion
-            dropout: Dropout probability
-            pretrained: Whether to use pretrained weights for both streams
-            use_attention: Whether to use attention-based fusion
-        """
-        super(DualStreamModel, self).__init__()
+        name_clean = model_name.lower().replace("-", "_")
+        if name_clean not in MODEL_REGISTRY:
+            raise ValueError(f"Unknown model name: {model_name}")
+            
+        self.model_info = MODEL_REGISTRY[name_clean]
+        self.active_streams = self.model_info["streams"]
+        
+        model_cfg = config.get('model', {})
+        spatial_backbone = model_cfg.get('spatial_backbone', 'resnet18')
+        spatial_feature_dim = model_cfg.get('spatial_feature_dim', 256)
+        frequency_channels = model_cfg.get('frequency_channels', 1)
+        fusion_dim = model_cfg.get('fusion_dim', 512)
+        dropout = model_cfg.get('dropout', 0.5)
+        pretrained = model_cfg.get('pretrained', True)
         
         # Face streams
-        self.face_spatial_stream = SpatialStream(
-            backbone_name=spatial_backbone,
-            feature_dim=spatial_feature_dim,
-            pretrained=pretrained
-        )
+        self.face_spatial_stream = None
+        if 'face_spatial' in self.active_streams:
+            self.face_spatial_stream = SpatialStream(
+                backbone_name=spatial_backbone,
+                feature_dim=spatial_feature_dim,
+                pretrained=pretrained
+            )
+            
+        self.face_frequency_stream = None
+        if 'face_frequency' in self.active_streams:
+            self.face_frequency_stream = FrequencyStream(
+                input_channels=frequency_channels,
+                feature_dim=spatial_feature_dim,
+                pretrained=False  # Trained from scratch
+            )
+            
+        # Frame streams
+        self.frame_spatial_stream = None
+        if 'frame_spatial' in self.active_streams:
+            self.frame_spatial_stream = SpatialStream(
+                backbone_name=spatial_backbone,
+                feature_dim=spatial_feature_dim,
+                pretrained=pretrained
+            )
+            
+        self.frame_frequency_stream = None
+        if 'frame_frequency' in self.active_streams:
+            self.frame_frequency_stream = FrequencyStream(
+                input_channels=frequency_channels,
+                feature_dim=spatial_feature_dim,
+                pretrained=False  # Trained from scratch
+            )
+            
+        num_active = len(self.active_streams)
         
-        self.face_frequency_stream = FrequencyStream(
-            input_channels=frequency_channels,
-            feature_dim=spatial_feature_dim,
-            pretrained=False  # Don't use pretrained weights for frequency domain
-        )
+        if num_active > 1:
+            self.fusion = nn.Sequential(
+                nn.Linear(spatial_feature_dim * num_active, fusion_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout),
+                nn.Linear(fusion_dim, fusion_dim // 2),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout)
+            )
+            self.classifier = nn.Sequential(
+                nn.Linear(fusion_dim // 2, 1)
+            )
+        else:
+            self.fusion = None
+            self.classifier = nn.Sequential(
+                nn.Linear(spatial_feature_dim, 1)
+            )
+            
+        self._initialize_weights()
         
-        # Frame streams (whole frame)
-        self.frame_spatial_stream = SpatialStream(
-            backbone_name=spatial_backbone,
-            feature_dim=spatial_feature_dim,
-            pretrained=pretrained
-        )
-        
-        self.frame_frequency_stream = FrequencyStream(
-            input_channels=frequency_channels,
-            feature_dim=spatial_feature_dim,
-            pretrained=False  # Don't use pretrained weights for frequency domain
-        )
-        
-        self.use_attention = use_attention
-        
-        if use_attention:
-            # Attention-based fusion for 4 streams
-            self.attention_weights = nn.Linear(spatial_feature_dim * 4, 4)
-        
-        # Fusion layers - now fusing 4 streams
-        self.fusion = nn.Sequential(
-            nn.Linear(spatial_feature_dim * 4, fusion_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(fusion_dim, fusion_dim // 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout)
-        )
-        
-        # Classification head
-        self.classifier = nn.Sequential(
-            nn.Linear(fusion_dim // 2, 1),
-            nn.Sigmoid()
-        )
-        
-        # Initialize fusion and classifier layers
-        self._initialize_fusion_layers()
-    
-    def _initialize_fusion_layers(self):
-        """Initialize fusion and classifier layers with proper weights."""
-        for module in self.fusion.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-        
-        # Initialize classifier with smaller weights to start near 0.5 (random guess)
+    def _initialize_weights(self):
+        if self.fusion is not None:
+            for module in self.fusion.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                    if module.bias is not None:
+                        nn.init.constant_(module.bias, 0.0)
+                        
         for module in self.classifier.modules():
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=0.01)
                 if module.bias is not None:
-                    nn.init.constant_(module.bias, 0.0)  # Start near 0.5 after sigmoid
-    
+                    nn.init.constant_(module.bias, 0.0)
+                    
     def forward(self, face_spatial: torch.Tensor, face_frequency: torch.Tensor,
                 frame_spatial: torch.Tensor, frame_frequency: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass through quad-stream model.
-        
-        Args:
-            face_spatial: Face crop RGB image (B, 3, H, W)
-            face_frequency: Face crop frequency spectrum (B, C, H, W)
-            frame_spatial: Whole frame RGB image (B, 3, H, W)
-            frame_frequency: Whole frame frequency spectrum (B, C, H, W)
-            
-        Returns:
-            Binary classification logits (B, 1)
+        Forward pass through active streams.
         """
-        # Extract features from all 4 streams
-        face_spatial_features = self.face_spatial_stream(face_spatial)
-        face_frequency_features = self.face_frequency_stream(face_frequency)
-        frame_spatial_features = self.frame_spatial_stream(frame_spatial)
-        frame_frequency_features = self.frame_frequency_stream(frame_frequency)
-        
-        # Fusion
-        if self.use_attention:
-            # Compute attention weights for 4 streams
-            concat_features = torch.cat([
-                face_spatial_features, 
-                face_frequency_features,
-                frame_spatial_features,
-                frame_frequency_features
-            ], dim=1)
-            attention_logits = self.attention_weights(concat_features)
-            attention_weights = torch.softmax(attention_logits, dim=1)
+        features = []
+        if self.face_spatial_stream is not None:
+            features.append(self.face_spatial_stream(face_spatial))
+        if self.face_frequency_stream is not None:
+            features.append(self.face_frequency_stream(face_frequency))
+        if self.frame_spatial_stream is not None:
+            features.append(self.frame_spatial_stream(frame_spatial))
+        if self.frame_frequency_stream is not None:
+            features.append(self.frame_frequency_stream(frame_frequency))
             
-            # Apply attention
-            face_spatial_attended = face_spatial_features * attention_weights[:, 0:1]
-            face_frequency_attended = face_frequency_features * attention_weights[:, 1:2]
-            frame_spatial_attended = frame_spatial_features * attention_weights[:, 2:3]
-            frame_frequency_attended = frame_frequency_features * attention_weights[:, 3:4]
-            
-            fused = torch.cat([
-                face_spatial_attended,
-                face_frequency_attended,
-                frame_spatial_attended,
-                frame_frequency_attended
-            ], dim=1)
-        else:
-            # Simple concatenation of all 4 streams
-            fused = torch.cat([
-                face_spatial_features,
-                face_frequency_features,
-                frame_spatial_features,
-                frame_frequency_features
-            ], dim=1)
-        
-        # Pass through fusion layers
-        fused = self.fusion(fused)
-        
-        # Classification
+        fused = torch.cat(features, dim=1)
+        if self.fusion is not None:
+            fused = self.fusion(fused)
         output = self.classifier(fused)
-        
         return output
 
 
+class DualStreamModel(UnifiedMultiStreamModel):
+    """Backward compatibility alias for UnifiedMultiStreamModel configured as full quad_stream."""
+    
+    def __init__(self, **kwargs):
+        config = {
+            'model': {
+                'spatial_backbone': kwargs.get('spatial_backbone', 'resnet18'),
+                'spatial_feature_dim': kwargs.get('spatial_feature_dim', 256),
+                'frequency_channels': kwargs.get('frequency_channels', 1),
+                'fusion_dim': kwargs.get('fusion_dim', 512),
+                'dropout': kwargs.get('dropout', 0.5),
+                'pretrained': kwargs.get('pretrained', True)
+            }
+        }
+        super(DualStreamModel, self).__init__(model_name="quad_stream", config=config)

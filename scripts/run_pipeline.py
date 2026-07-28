@@ -44,7 +44,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default="results", help="Directory to save evaluation results")
     parser.add_argument("--force_reprocess", action="store_true", help="Force regeneration of preprocessed metadata")
     parser.add_argument("--smoke_test", action="store_true", help="Run end-to-end smoke test on a tiny balanced subset")
-    parser.add_argument("--seeds", type=int, nargs="+", default=[42], help="List of random seeds to run over")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 2026], help="List of random seeds to run over")
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent.parent
@@ -203,14 +203,17 @@ def main():
         for model_name in models_to_run:
             # 3. Model Training
             if not args.skip_train:
-                run_command([
+                train_cmd = [
                     sys.executable,
                     str(project_root / "scripts" / "train.py"),
                     "--model", model_name,
                     "--config", args.config,
                     "--epochs", str(args.epochs),
                     "--seed", str(seed)
-                ], f"Training Model: {model_name.upper()} (Seed {seed})")
+                ]
+                if args.smoke_test:
+                    train_cmd.append("--smoke_test")
+                run_command(train_cmd, f"Training Model: {model_name.upper()} (Seed {seed})")
 
             # Determine checkpoint path (suffix checkpoint name with seed value)
             model_name_clean = model_name.lower().replace("-", "_")
@@ -222,7 +225,7 @@ def main():
                     checkpoint_path = fallback_path
 
             # 4. Evaluate Model
-            run_command([
+            eval_cmd = [
                 sys.executable,
                 str(project_root / "scripts" / "evaluate.py"),
                 "--model", model_name,
@@ -232,7 +235,10 @@ def main():
                 "--optimal_threshold",
                 "--output_dir", args.output_dir,
                 "--seed", str(seed)
-            ], f"Evaluating Model: {model_name.upper()} (Seed {seed})")
+            ]
+            if args.smoke_test:
+                eval_cmd.append("--allow_random_weights")
+            run_command(eval_cmd, f"Evaluating Model: {model_name.upper()} (Seed {seed})")
 
             # Parse results
             results_path = Path(args.output_dir) / f"{model_name_clean}_{args.split}_results_seed{seed}.txt"
@@ -243,6 +249,10 @@ def main():
                         if ":" in line:
                             parts = line.split(":")
                             key = parts[0].strip().lower()
+                            if key == "f1-score":
+                                key = "f1"
+                            elif key.startswith("video_"):
+                                key = key.replace("video_", "")
                             try:
                                 val_str = parts[1].strip().replace('%', '')
                                 val = float(val_str)
